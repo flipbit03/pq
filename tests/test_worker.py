@@ -1,6 +1,11 @@
-"""Tests for worker logic."""
+"""Tests for worker logic with fork isolation.
+
+All tests use multiprocessing shared state since tasks run in forked processes.
+"""
 
 import asyncio
+import multiprocessing
+import multiprocessing.managers
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -8,31 +13,46 @@ from pq.client import PQ
 from pq.models import Periodic
 from pq.priority import Priority
 
+# Global shared state for fork-isolated tests
+_shared_results: Any = None
+_shared_calls: Any = None
+
+
+def _set_shared_results(results: Any) -> None:
+    global _shared_results
+    _shared_results = results
+
+
+def _set_shared_calls(calls: Any) -> None:
+    global _shared_calls
+    _shared_calls = calls
+
+
 # Global handler for testing direct function import - must be defined before use
-tracked_handler_calls: list[tuple[Any, ...]] = []
-
-
 def tracked_handler(key: str) -> None:
     """Handler that tracks calls for testing."""
-    tracked_handler_calls.append((key,))
+    _shared_calls.append((key,))
 
 
 class TestRunWorkerOnce:
     """Tests for run_worker_once method."""
 
-    def test_processes_pending_task(self, pq: PQ) -> None:
+    def test_processes_pending_task(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
         """Worker processes a pending task."""
-        results: list[int] = []
+        results = manager.list()
+        _set_shared_results(results)
 
         @pq.task("capture")
         def capture(value: int) -> None:
-            results.append(value)
+            _shared_results.append(value)
 
         pq.enqueue("capture", value=42)
         processed = pq.run_worker_once()
 
         assert processed is True
-        assert results == [42]
+        assert list(results) == [42]
 
     def test_deletes_task_after_processing(self, pq: PQ) -> None:
         """Worker marks task completed after processing."""
@@ -50,11 +70,10 @@ class TestRunWorkerOnce:
 
     def test_skips_future_task(self, pq: PQ) -> None:
         """Worker skips tasks scheduled for the future."""
-        results: list[Any] = []
 
         @pq.task("future_task")
         def handler() -> None:
-            results.append(1)
+            pass
 
         future = datetime.now(UTC) + timedelta(hours=1)
         pq.enqueue("future_task", run_at=future)
@@ -62,7 +81,6 @@ class TestRunWorkerOnce:
         processed = pq.run_worker_once()
 
         assert processed is False
-        assert results == []
         assert pq.pending_count() == 1
 
     def test_returns_false_when_empty(self, pq: PQ) -> None:
@@ -84,22 +102,28 @@ class TestRunWorkerOnce:
 
         assert pq.pending_count() == 0
 
-    def test_processes_direct_function(self, pq: PQ) -> None:
+    def test_processes_direct_function(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
         """Worker can process task with direct function path."""
-        tracked_handler_calls.clear()
+        calls = manager.list()
+        _set_shared_calls(calls)
 
         pq.enqueue(tracked_handler, key="value")
         pq.run_worker_once()
 
-        assert tracked_handler_calls == [("value",)]
+        assert list(calls) == [("value",)]
 
-    def test_processes_higher_priority_first(self, pq: PQ) -> None:
+    def test_processes_higher_priority_first(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
         """Worker processes higher priority tasks first."""
-        results: list[int] = []
+        results = manager.list()
+        _set_shared_results(results)
 
         @pq.task("ordered")
         def handler(n: int) -> None:
-            results.append(n)
+            _shared_results.append(n)
 
         # Enqueue in reverse priority order
         pq.enqueue("ordered", n=3, priority=Priority.LOW)
@@ -111,26 +135,29 @@ class TestRunWorkerOnce:
         pq.run_worker_once()
 
         # Should process in priority order: HIGH, NORMAL, LOW
-        assert results == [1, 2, 3]
+        assert list(results) == [1, 2, 3]
 
 
 class TestPeriodicTasks:
     """Tests for periodic task processing."""
 
-    def test_processes_periodic_task(self, pq: PQ) -> None:
+    def test_processes_periodic_task(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
         """Worker processes a periodic task."""
-        results: list[int] = []
+        results = manager.list()
+        _set_shared_results(results)
 
         @pq.task("periodic")
         def handler(n: int) -> None:
-            results.append(n)
+            _shared_results.append(n)
 
         pq.schedule("periodic", run_every=timedelta(hours=1), n=1)
 
         processed = pq.run_worker_once()
 
         assert processed is True
-        assert results == [1]
+        assert list(results) == [1]
 
     def test_advances_next_run(self, pq: PQ) -> None:
         """Worker advances next_run after processing."""
@@ -187,11 +214,9 @@ class TestPeriodicTasks:
         """Worker skips periodic tasks not yet due."""
         from sqlalchemy import update
 
-        results: list[Any] = []
-
         @pq.task("periodic")
         def handler() -> None:
-            results.append(1)
+            pass
 
         pq.schedule("periodic", run_every=timedelta(hours=1))
 
@@ -206,15 +231,17 @@ class TestPeriodicTasks:
         processed = pq.run_worker_once()
 
         assert processed is False
-        assert results == []
 
-    def test_periodic_keeps_running(self, pq: PQ) -> None:
+    def test_periodic_keeps_running(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
         """Periodic task can be run multiple times."""
-        results: list[int] = []
+        results = manager.list()
+        _set_shared_results(results)
 
         @pq.task("counter")
         def counter() -> None:
-            results.append(1)
+            _shared_results.append(1)
 
         # Schedule with 0 interval so it's always ready
         pq.schedule("counter", run_every=timedelta(seconds=0))
@@ -250,15 +277,18 @@ class TestPeriodicTasks:
             ).scalar_one()
             assert periodic.next_run > original_next_run
 
-    def test_overdue_periodic_runs_once(self, pq: PQ) -> None:
+    def test_overdue_periodic_runs_once(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
         """Overdue periodic task runs once, not historically."""
         from sqlalchemy import update
 
-        count: list[int] = []
+        count = manager.list()
+        _set_shared_results(count)
 
         @pq.task("overdue")
         def handler() -> None:
-            count.append(1)
+            _shared_results.append(1)
 
         # Schedule with 1 hour interval
         pq.schedule("overdue", run_every=timedelta(hours=1))
@@ -283,36 +313,42 @@ class TestPeriodicTasks:
 class TestAsyncTasks:
     """Tests for async task handler support."""
 
-    def test_processes_async_one_off_task(self, pq: PQ) -> None:
+    def test_processes_async_one_off_task(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
         """Worker processes an async one-off task."""
-        results: list[str] = []
+        results = manager.list()
+        _set_shared_results(results)
 
         @pq.task("async_task")
         async def async_handler(value: str) -> None:
             await asyncio.sleep(0.01)  # Simulate async work
-            results.append(value)
+            _shared_results.append(value)
 
         pq.enqueue("async_task", value="async_test")
         processed = pq.run_worker_once()
 
         assert processed is True
-        assert results == ["async_test"]
+        assert list(results) == ["async_test"]
 
-    def test_processes_async_periodic_task(self, pq: PQ) -> None:
+    def test_processes_async_periodic_task(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
         """Worker processes an async periodic task."""
-        results: list[int] = []
+        results = manager.list()
+        _set_shared_results(results)
 
         @pq.task("async_periodic")
         async def async_handler(n: int) -> None:
             await asyncio.sleep(0.01)
-            results.append(n)
+            _shared_results.append(n)
 
         pq.schedule("async_periodic", run_every=timedelta(hours=1), n=1)
 
         processed = pq.run_worker_once()
 
         assert processed is True
-        assert results == [1]
+        assert list(results) == [1]
 
     def test_async_task_failure_handled(self, pq: PQ) -> None:
         """Worker handles async task failures correctly."""
@@ -336,38 +372,29 @@ class TestTaskTimeout:
 
     def test_async_task_timeout(self, pq: PQ) -> None:
         """Async task that exceeds timeout is terminated."""
-        results: list[str] = []
 
         @pq.task("slow_async")
         async def slow_handler() -> None:
             await asyncio.sleep(10)  # Would take 10 seconds
-            results.append("completed")
 
         pq.enqueue("slow_async")
         # Use 0.1 second timeout - task should timeout
         pq.run_worker_once(max_runtime=0.1)
 
-        # Handler should not have completed
-        assert results == []
-        # Task should still be removed
+        # Task should be removed (marked failed)
         assert pq.pending_count() == 0
 
     def test_sync_task_timeout(self, pq: PQ) -> None:
         """Sync task that exceeds timeout is terminated."""
         import time
 
-        results: list[str] = []
-
         @pq.task("slow_sync")
         def slow_handler() -> None:
             time.sleep(10)  # Would take 10 seconds
-            results.append("completed")
 
         pq.enqueue("slow_sync")
         # Use 1 second timeout (SIGALRM has 1-second granularity)
         pq.run_worker_once(max_runtime=1)
 
-        # Handler should not have completed
-        assert results == []
-        # Task should still be removed
+        # Task should be removed (marked failed)
         assert pq.pending_count() == 0

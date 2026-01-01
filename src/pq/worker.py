@@ -66,11 +66,6 @@ def _child_timeout_handler(signum: int, frame: Any) -> None:
     os._exit(EXIT_TIMEOUT)
 
 
-def _direct_timeout_handler(signum: int, frame: Any) -> None:
-    """Signal handler for timeout in direct (non-fork) execution."""
-    raise TaskTimeoutError("Task exceeded max runtime")
-
-
 def _run_in_child(
     handler: Callable[..., Any],
     args: tuple[Any, ...],
@@ -197,49 +192,11 @@ def _execute_in_fork(
                     raise Exception(f"Task failed with exit code {exit_code}")
 
 
-def _execute_handler_direct(
-    handler: Callable[..., Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    *,
-    max_runtime: float,
-) -> None:
-    """Execute handler directly without fork (for testing only).
-
-    Args:
-        handler: Task handler function.
-        args: Positional arguments for handler.
-        kwargs: Keyword arguments for handler.
-        max_runtime: Maximum execution time in seconds.
-
-    Raises:
-        TaskTimeoutError: If task exceeds max runtime.
-        Exception: If task raises an exception.
-    """
-    import threading
-
-    if inspect.iscoroutinefunction(handler):
-        asyncio.run(asyncio.wait_for(handler(*args, **kwargs), timeout=max_runtime))
-    elif threading.current_thread() is threading.main_thread():
-        # Use SIGALRM for timeout (only works in main thread)
-        old_handler = signal.signal(signal.SIGALRM, _direct_timeout_handler)
-        signal.alarm(int(max_runtime))
-        try:
-            handler(*args, **kwargs)
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-    else:
-        # In non-main threads, run without signal-based timeout
-        handler(*args, **kwargs)
-
-
 def run_worker(
     pq: PQ,
     *,
     poll_interval: float = 1.0,
     max_runtime: float = DEFAULT_MAX_RUNTIME,
-    _no_fork: bool = False,
 ) -> None:
     """Run the worker loop indefinitely.
 
@@ -249,20 +206,17 @@ def run_worker(
         pq: PQ client instance.
         poll_interval: Seconds to sleep between polls when idle.
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
-        _no_fork: Internal testing flag. Do not use in production.
     """
     logger.info("Starting PQ worker (fork isolation enabled)...")
     try:
         while True:
-            if not run_worker_once(pq, max_runtime=max_runtime, _no_fork=_no_fork):
+            if not run_worker_once(pq, max_runtime=max_runtime):
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Worker stopped.")
 
 
-def run_worker_once(
-    pq: PQ, *, max_runtime: float = DEFAULT_MAX_RUNTIME, _no_fork: bool = False
-) -> bool:
+def run_worker_once(pq: PQ, *, max_runtime: float = DEFAULT_MAX_RUNTIME) -> bool:
     """Process a single task if available.
 
     Checks one-off tasks first, then periodic tasks.
@@ -270,31 +224,27 @@ def run_worker_once(
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
-        _no_fork: Internal testing flag. Do not use in production.
 
     Returns:
         True if a task was processed, False if queue was empty.
     """
     # Try one-off task first
-    if _process_one_off_task(pq, max_runtime=max_runtime, _no_fork=_no_fork):
+    if _process_one_off_task(pq, max_runtime=max_runtime):
         return True
 
     # Try periodic task
-    if _process_periodic_task(pq, max_runtime=max_runtime, _no_fork=_no_fork):
+    if _process_periodic_task(pq, max_runtime=max_runtime):
         return True
 
     return False
 
 
-def _process_one_off_task(
-    pq: PQ, *, max_runtime: float, _no_fork: bool = False
-) -> bool:
+def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
     """Claim and process a one-off task.
 
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time in seconds.
-        _no_fork: If True, run handler directly without fork.
 
     Returns:
         True if a task was processed.
@@ -334,14 +284,13 @@ def _process_one_off_task(
     finally:
         session.close()
 
-    # Execute handler (forked unless _no_fork)
-    execute_fn = _execute_handler_direct if _no_fork else _execute_in_fork
+    # Execute handler in forked process
     session = pq._session_factory()
     start = time.perf_counter()
     try:
         handler = pq._registry.resolve(name)
         args, kwargs = deserialize(payload)
-        execute_fn(handler, args, kwargs, max_runtime=max_runtime)
+        _execute_in_fork(handler, args, kwargs, max_runtime=max_runtime)
         elapsed = time.perf_counter() - start
 
         # Mark as completed
@@ -413,15 +362,12 @@ def _calculate_next_run_cron(cron_expr: str) -> datetime:
     return cron.get_next(datetime)
 
 
-def _process_periodic_task(
-    pq: PQ, *, max_runtime: float, _no_fork: bool = False
-) -> bool:
+def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
     """Claim and process a periodic task.
 
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time in seconds.
-        _no_fork: If True, run handler directly without fork.
 
     Returns:
         True if a task was processed.
@@ -463,14 +409,13 @@ def _process_periodic_task(
     finally:
         session.close()
 
-    # Execute handler (forked unless _no_fork)
-    execute_fn = _execute_handler_direct if _no_fork else _execute_in_fork
+    # Execute handler in forked process
     if name is not None:
         start = time.perf_counter()
         try:
             handler = pq._registry.resolve(name)
             args, kwargs = deserialize(payload)
-            execute_fn(handler, args, kwargs, max_runtime=max_runtime)
+            _execute_in_fork(handler, args, kwargs, max_runtime=max_runtime)
             elapsed = time.perf_counter() - start
             logger.debug(f"Periodic task '{name}' completed in {elapsed:.3f} s")
 
