@@ -1,6 +1,5 @@
 """PQ client - main interface for task queue."""
 
-import logging
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -14,8 +13,6 @@ from sqlalchemy.orm import sessionmaker
 
 from pq.models import Base, Periodic, Task
 from pq.registry import TaskRegistry, get_function_path
-
-logger = logging.getLogger(__name__)
 
 
 class PQ:

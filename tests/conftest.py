@@ -13,7 +13,7 @@ from pq.registry import TaskRegistry
 def db_url() -> str:
     """Database URL for tests."""
     return os.environ.get(
-        "PQ_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
+        "PQ_DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/postgres"
     )
 
 

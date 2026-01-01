@@ -1,12 +1,10 @@
 """Integration tests for PQ - end-to-end scenarios."""
 
-import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import pytest
 
 from pq.client import PQ
 
@@ -102,22 +100,29 @@ class TestEndToEnd:
         # All tasks should be processed exactly once
         assert sorted(results) == [0, 1, 2, 3, 4]
 
-    def test_failed_task_logged_and_deleted(
-        self, pq: PQ, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Failed task is logged and removed."""
+    def test_failed_task_logged_and_deleted(self, pq: PQ) -> None:
+        """Failed task is logged and removed (error is logged via loguru)."""
+        from io import StringIO
 
-        @pq.task("fail")
-        def fail(payload: dict[str, Any]) -> None:
-            raise ValueError("boom")
+        from loguru import logger
 
-        pq.enqueue("fail", {})
+        # Capture loguru output
+        log_output = StringIO()
+        handler_id = logger.add(log_output, format="{message}")
 
-        with caplog.at_level(logging.ERROR):
+        try:
+
+            @pq.task("fail")
+            def fail(payload: dict[str, Any]) -> None:
+                raise ValueError("boom")
+
+            pq.enqueue("fail", {})
             pq.run_worker_once()
 
-        assert "boom" in caplog.text
-        assert pq.pending_count() == 0
+            assert "boom" in log_output.getvalue()
+            assert pq.pending_count() == 0
+        finally:
+            logger.remove(handler_id)
 
     def test_mixed_one_off_and_periodic(self, pq: PQ) -> None:
         """Worker handles both one-off and periodic tasks."""

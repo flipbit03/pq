@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import TYPE_CHECKING
 
+from loguru import logger
 from sqlalchemy import func, select
 
 from pq.models import Periodic, Task
 
 if TYPE_CHECKING:
     from pq.client import PQ
-
-logger = logging.getLogger(__name__)
 
 
 def run_worker(pq: PQ, *, poll_interval: float = 1.0) -> None:
