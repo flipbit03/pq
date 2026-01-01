@@ -158,6 +158,14 @@ def standalone_task(data: Any) -> None:
     logger.info(f"🚀 Standalone task executed with: {data}")
 
 
+# Task demonstrating pickle serialization for non-JSON types
+@pq.task("process_with_callback")
+def process_with_callback(data: Any, transformer: Any) -> None:
+    """Task that receives a custom object (pickled arg) and callback (pickled kwarg)."""
+    result = transformer(data.total)
+    logger.info(f"🔄 Processed: DataBundle.total={data.total} -> transformed={result}")
+
+
 # =============================================================================
 # COMMANDS
 # =============================================================================
@@ -173,10 +181,10 @@ def cmd_full() -> None:
 
     # Start fresh
     pq.clear_all()
-    logger.info("[1/9] CLEARED - Starting fresh")
+    logger.info("[1/10] CLEARED - Starting fresh")
 
     # === Registration Methods ===
-    logger.info("[2/9] REGISTRATION METHODS")
+    logger.info("[2/10] REGISTRATION METHODS")
     logger.info("-" * 40)
     logger.info("✓ @pq.task('greet') - Decorator registration")
     logger.info("✓ pq.register('send_email', fn) - Explicit registration")
@@ -185,7 +193,7 @@ def cmd_full() -> None:
     logger.info("")
 
     # === One-off Tasks ===
-    logger.info("[3/9] ENQUEUEING ONE-OFF TASKS")
+    logger.info("[3/10] ENQUEUEING ONE-OFF TASKS")
     logger.info("-" * 40)
 
     # By name (decorator-registered)
@@ -211,7 +219,7 @@ def cmd_full() -> None:
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Delayed Task ===
-    logger.info("[4/9] DELAYED TASK (run_at)")
+    logger.info("[4/10] DELAYED TASK (run_at)")
     logger.info("-" * 40)
     run_at = datetime.now(UTC) + timedelta(seconds=3)
     id6 = pq.enqueue("greet", name="Future", run_at=run_at)
@@ -219,7 +227,7 @@ def cmd_full() -> None:
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Cancellation ===
-    logger.info("[5/9] TASK CANCELLATION")
+    logger.info("[5/10] TASK CANCELLATION")
     logger.info("-" * 40)
     cancel_id = pq.enqueue("greet", name="WillBeCancelled")
     logger.info(f"Enqueued task -> id={cancel_id}")
@@ -229,7 +237,7 @@ def cmd_full() -> None:
     logger.info(f"Pending after cancel: {pq.pending_count()}\n")
 
     # === Error Handling ===
-    logger.info("[6/9] ERROR HANDLING")
+    logger.info("[6/10] ERROR HANDLING")
     logger.info("-" * 40)
     pq.enqueue("flaky", reason="demo failure")
     logger.info("Enqueued flaky task (will fail)")
@@ -237,7 +245,7 @@ def cmd_full() -> None:
     logger.info("Worker continued after error (task marked failed)\n")
 
     # === Async Tasks ===
-    logger.info("[7/9] ASYNC TASKS")
+    logger.info("[7/10] ASYNC TASKS")
     logger.info("-" * 40)
     id_async1 = pq.enqueue("async_greet", name="Async World")
     logger.info(f"Enqueued 'async_greet' -> id={id_async1}")
@@ -248,8 +256,30 @@ def cmd_full() -> None:
     pq.run_worker_once()
     logger.info("Async tasks completed\n")
 
+    # === Pickle Serialization (non-JSON types) ===
+    logger.info("[8/10] PICKLE SERIALIZATION (lambdas, custom objects)")
+    logger.info("-" * 40)
+
+    # Custom class instance as positional arg (pickled)
+    class DataBundle:
+        def __init__(self, items: list[int]) -> None:
+            self.items = items
+            self.total = sum(items)
+
+    bundle = DataBundle([10, 20, 30])
+    logger.info(f"Created DataBundle with total={bundle.total}")
+
+    # Lambda as keyword arg (pickled)
+    doubler = lambda x: x * 2  # noqa: E731
+
+    id_pickle = pq.enqueue("process_with_callback", bundle, transformer=doubler)
+    logger.info(f"Enqueued task with pickled arg + kwarg -> id={id_pickle}")
+
+    pq.run_worker_once()
+    logger.info("Pickle serialization demo complete\n")
+
     # === Periodic Tasks ===
-    logger.info("[8/9] PERIODIC TASKS")
+    logger.info("[9/10] PERIODIC TASKS")
     logger.info("-" * 40)
     pq.schedule("tick", run_every=timedelta(seconds=2))
     logger.info("Scheduled 'tick' every 2 seconds")
@@ -258,7 +288,7 @@ def cmd_full() -> None:
     logger.info(f"Periodic count: {pq.periodic_count()}\n")
 
     # === Process Everything ===
-    logger.info("[9/9] PROCESSING")
+    logger.info("[10/10] PROCESSING")
     logger.info("-" * 40)
     logger.info("Processing one-off tasks...")
 
