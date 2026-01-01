@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from pydantic import BaseModel
 
 from pq.client import PQ
 
@@ -13,29 +14,29 @@ class TestEndToEnd:
     """End-to-end integration tests."""
 
     def test_enqueue_and_process(self, pq: PQ) -> None:
-        """Full flow: enqueue -> worker processes -> task deleted."""
-        results: list[dict[str, Any]] = []
+        """Full flow: enqueue -> worker processes -> task completed."""
+        results: list[int] = []
 
         @pq.task("capture")
-        def capture(payload: dict[str, Any]) -> None:
-            results.append(payload)
+        def capture(value: int) -> None:
+            results.append(value)
 
-        pq.enqueue("capture", {"value": 42})
+        pq.enqueue("capture", value=42)
         pq.run_worker_once()
 
-        assert results == [{"value": 42}]
+        assert results == [42]
         assert pq.pending_count() == 0
 
     def test_scheduled_task_waits(self, pq: PQ) -> None:
         """Future task not processed until run_at."""
-        results: list[dict[str, Any]] = []
+        results: list[int] = []
 
         @pq.task("delayed")
-        def delayed(payload: dict[str, Any]) -> None:
-            results.append(payload)
+        def delayed(v: int) -> None:
+            results.append(v)
 
         future = datetime.now(UTC) + timedelta(hours=1)
-        pq.enqueue("delayed", {"v": 1}, run_at=future)
+        pq.enqueue("delayed", v=1, run_at=future)
         pq.run_worker_once()
 
         assert results == []  # Not yet
@@ -46,7 +47,7 @@ class TestEndToEnd:
         count: list[int] = []
 
         @pq.task("counter")
-        def counter(payload: dict[str, Any]) -> None:
+        def counter() -> None:
             count.append(1)
 
         pq.schedule("counter", run_every=timedelta(seconds=0))  # Immediate
@@ -62,12 +63,12 @@ class TestEndToEnd:
         results: list[int] = []
 
         @pq.task("once")
-        def once(payload: dict[str, Any]) -> None:
-            results.append(payload["id"])
+        def once(task_id: int) -> None:
+            results.append(task_id)
             time.sleep(0.1)  # Simulate work
 
         # Enqueue single task
-        pq.enqueue("once", {"id": 1})
+        pq.enqueue("once", task_id=1)
 
         # Two workers race
         with ThreadPoolExecutor(max_workers=2) as ex:
@@ -82,13 +83,13 @@ class TestEndToEnd:
         results: list[int] = []
 
         @pq.task("work")
-        def work(payload: dict[str, Any]) -> None:
+        def work(task_id: int) -> None:
             time.sleep(0.05)  # Simulate work
-            results.append(payload["id"])
+            results.append(task_id)
 
         # Enqueue multiple tasks
         for i in range(5):
-            pq.enqueue("work", {"id": i})
+            pq.enqueue("work", task_id=i)
 
         # Process with multiple workers
         with ThreadPoolExecutor(max_workers=3) as ex:
@@ -101,7 +102,7 @@ class TestEndToEnd:
         assert sorted(results) == [0, 1, 2, 3, 4]
 
     def test_failed_task_logged_and_deleted(self, pq: PQ) -> None:
-        """Failed task is logged and removed (error is logged via loguru)."""
+        """Failed task is logged and marked failed."""
         from io import StringIO
 
         from loguru import logger
@@ -113,10 +114,10 @@ class TestEndToEnd:
         try:
 
             @pq.task("fail")
-            def fail(payload: dict[str, Any]) -> None:
+            def fail() -> None:
                 raise ValueError("boom")
 
-            pq.enqueue("fail", {})
+            pq.enqueue("fail")
             pq.run_worker_once()
 
             assert "boom" in log_output.getvalue()
@@ -130,17 +131,17 @@ class TestEndToEnd:
         periodic_results: list[int] = []
 
         @pq.task("one_off")
-        def one_off(payload: dict[str, Any]) -> None:
-            one_off_results.append(payload["n"])
+        def one_off(n: int) -> None:
+            one_off_results.append(n)
 
         @pq.task("periodic")
-        def periodic(payload: dict[str, Any]) -> None:
-            periodic_results.append(payload["n"])
+        def periodic(n: int) -> None:
+            periodic_results.append(n)
 
         # Schedule both
-        pq.enqueue("one_off", {"n": 1})
-        pq.enqueue("one_off", {"n": 2})
-        pq.schedule("periodic", run_every=timedelta(seconds=0), payload={"n": 100})
+        pq.enqueue("one_off", n=1)
+        pq.enqueue("one_off", n=2)
+        pq.schedule("periodic", run_every=timedelta(seconds=0), n=100)
 
         # Process all
         for _ in range(5):
@@ -157,10 +158,10 @@ class TestEndToEnd:
         results: list[int] = []
 
         @pq.task("work")
-        def work(payload: dict[str, Any]) -> None:
-            results.append(payload["n"])
+        def work(n: int) -> None:
+            results.append(n)
 
-        task_id = pq.enqueue("work", {"n": 1})
+        task_id = pq.enqueue("work", n=1)
         pq.cancel(task_id)
 
         pq.run_worker_once()
@@ -172,7 +173,7 @@ class TestEndToEnd:
         count: list[int] = []
 
         @pq.task("counter")
-        def counter(payload: dict[str, Any]) -> None:
+        def counter() -> None:
             count.append(1)
 
         pq.schedule("counter", run_every=timedelta(seconds=0))
@@ -194,36 +195,141 @@ class TestPayloadTypes:
 
     def test_empty_payload(self, pq: PQ) -> None:
         """Empty payload works."""
-        results: list[dict[str, Any]] = []
+        called: list[bool] = []
 
         @pq.task("empty")
-        def handler(payload: dict[str, Any]) -> None:
-            results.append(payload)
+        def handler() -> None:
+            called.append(True)
 
-        pq.enqueue("empty", {})
+        pq.enqueue("empty")
         pq.run_worker_once()
 
-        assert results == [{}]
+        assert called == [True]
 
-    def test_complex_payload(self, pq: PQ) -> None:
-        """Complex nested payload is preserved."""
+    def test_complex_kwargs(self, pq: PQ) -> None:
+        """Complex nested kwargs are preserved."""
         results: list[dict[str, Any]] = []
 
         @pq.task("complex")
-        def handler(payload: dict[str, Any]) -> None:
-            results.append(payload)
+        def handler(**kwargs: Any) -> None:
+            results.append(kwargs)
 
-        complex_payload = {
-            "string": "value",
-            "number": 42,
-            "float": 3.14,
-            "bool": True,
-            "null": None,
-            "list": [1, 2, 3],
-            "nested": {"a": {"b": {"c": "deep"}}},
-        }
-
-        pq.enqueue("complex", complex_payload)
+        pq.enqueue(
+            "complex",
+            string="value",
+            number=42,
+            float_val=3.14,
+            bool_val=True,
+            null=None,
+            items=[1, 2, 3],
+            nested={"a": {"b": {"c": "deep"}}},
+        )
         pq.run_worker_once()
 
-        assert results == [complex_payload]
+        assert len(results) == 1
+        assert results[0]["string"] == "value"
+        assert results[0]["number"] == 42
+        assert results[0]["nested"]["a"]["b"]["c"] == "deep"
+
+    def test_positional_args(self, pq: PQ) -> None:
+        """Positional arguments work correctly."""
+        results: list[tuple[Any, ...]] = []
+
+        @pq.task("positional")
+        def handler(a: int, b: str, c: list[int]) -> None:
+            results.append((a, b, c))
+
+        pq.enqueue("positional", 1, "hello", [1, 2, 3])
+        pq.run_worker_once()
+
+        assert results == [(1, "hello", [1, 2, 3])]
+
+    def test_mixed_args_kwargs(self, pq: PQ) -> None:
+        """Mixed positional and keyword arguments work."""
+        results: list[tuple[Any, ...]] = []
+
+        @pq.task("mixed")
+        def handler(a: int, b: str, c: int = 0) -> None:
+            results.append((a, b, c))
+
+        pq.enqueue("mixed", 1, "hello", c=42)
+        pq.run_worker_once()
+
+        assert results == [(1, "hello", 42)]
+
+    def test_pydantic_as_arg(self, pq: PQ) -> None:
+        """Pydantic model as positional arg is serialized correctly."""
+
+        class UserPayload(BaseModel):
+            user_id: int
+            email: str
+
+        results: list[dict[str, Any]] = []
+
+        @pq.task("pydantic")
+        def handler(user: dict[str, Any]) -> None:
+            results.append(user)
+
+        payload = UserPayload(user_id=123, email="test@example.com")
+        pq.enqueue("pydantic", payload)
+        pq.run_worker_once()
+
+        assert len(results) == 1
+        assert results[0] == {"user_id": 123, "email": "test@example.com"}
+
+    def test_pydantic_periodic(self, pq: PQ) -> None:
+        """Pydantic model works with periodic tasks."""
+
+        class ReportConfig(BaseModel):
+            report_type: str
+            recipients: list[str]
+
+        results: list[dict[str, Any]] = []
+
+        @pq.task("pydantic_periodic")
+        def handler(config: dict[str, Any]) -> None:
+            results.append(config)
+
+        config = ReportConfig(report_type="daily", recipients=["a@b.com", "c@d.com"])
+        pq.schedule("pydantic_periodic", config, run_every=timedelta(seconds=0))
+        pq.run_worker_once()
+
+        assert len(results) == 1
+        assert results[0] == {
+            "report_type": "daily",
+            "recipients": ["a@b.com", "c@d.com"],
+        }
+
+    def test_pickle_fallback_for_custom_object(self, pq: PQ) -> None:
+        """Non-JSON-serializable objects are pickled."""
+
+        class CustomData:
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+        results: list[int] = []
+
+        @pq.task("pickle")
+        def handler(data: CustomData) -> None:
+            results.append(data.value)
+
+        pq.enqueue("pickle", CustomData(42))
+        pq.run_worker_once()
+
+        assert results == [42]
+
+    def test_pickle_fallback_for_function(self, pq: PQ) -> None:
+        """Functions are pickled as fallback."""
+        results: list[int] = []
+
+        def callback(x: int) -> int:
+            return x * 2
+
+        @pq.task("func")
+        def handler(cb: Any) -> None:
+            results.append(cb(21))
+
+        pq.enqueue("func", callback)
+        pq.run_worker_once()
+
+        assert results == [42]

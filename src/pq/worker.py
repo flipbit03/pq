@@ -7,12 +7,15 @@ import inspect
 import signal
 import threading
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from croniter import croniter
 from loguru import logger
 from sqlalchemy import func, select
 
-from pq.models import Periodic, Task
+from pq.models import Periodic, Task, TaskStatus
+from pq.serialization import deserialize
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -35,29 +38,34 @@ def _timeout_handler(signum: int, frame: Any) -> None:
 
 
 def _execute_handler(
-    handler: Callable[..., Any], payload: dict[str, Any], *, max_runtime: float
+    handler: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    max_runtime: float,
 ) -> None:
     """Execute a handler, supporting both sync and async functions with timeout.
 
     Args:
         handler: Task handler function.
-        payload: Data to pass to handler.
+        args: Positional arguments for handler.
+        kwargs: Keyword arguments for handler.
         max_runtime: Maximum execution time in seconds.
     """
     if inspect.iscoroutinefunction(handler):
-        asyncio.run(asyncio.wait_for(handler(payload), timeout=max_runtime))
+        asyncio.run(asyncio.wait_for(handler(*args, **kwargs), timeout=max_runtime))
     elif threading.current_thread() is threading.main_thread():
         # Use SIGALRM for sync timeout (Unix only, main thread only)
         old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
         signal.alarm(int(max_runtime))
         try:
-            handler(payload)
+            handler(*args, **kwargs)
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
     else:
         # In non-main threads, run without timeout (signals not available)
-        handler(payload)
+        handler(*args, **kwargs)
 
 
 def run_worker(
@@ -113,12 +121,14 @@ def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
         True if a task was processed.
     """
     session = pq._session_factory()
+    task = None
     try:
-        # Claim highest priority due task with FOR UPDATE SKIP LOCKED
+        # Claim highest priority pending task with FOR UPDATE SKIP LOCKED
         stmt = (
             select(Task)
+            .where(Task.status == TaskStatus.PENDING)
             .where(Task.run_at <= func.now())
-            .order_by(Task.priority, Task.run_at)
+            .order_by(Task.priority.desc(), Task.run_at)
             .with_for_update(skip_locked=True)
             .limit(1)
         )
@@ -127,38 +137,90 @@ def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
         if task is None:
             return False
 
-        # Get task data before deleting
-        name = task.name
-        payload = task.payload
-
-        # Delete task (always, even on failure)
-        session.delete(task)
+        # Mark as running
+        task.status = TaskStatus.RUNNING
+        task.started_at = datetime.now(UTC)
+        task.attempts += 1
         session.commit()
 
-        # Execute handler outside transaction
-        start = time.perf_counter()
-        try:
-            handler = pq._registry.resolve(name)
-            _execute_handler(handler, payload, max_runtime=max_runtime)
-            elapsed = time.perf_counter() - start
-            logger.debug(f"Task '{name}' completed in {elapsed:.3f} s")
-        except asyncio.TimeoutError:
-            elapsed = time.perf_counter() - start
-            logger.error(f"Task '{name}' timed out after {elapsed:.3f} s")
-        except TaskTimeoutError:
-            elapsed = time.perf_counter() - start
-            logger.error(f"Task '{name}' timed out after {elapsed:.3f} s")
-        except Exception as e:
-            elapsed = time.perf_counter() - start
-            logger.error(f"Task '{name}' failed after {elapsed:.3f} s: {e}")
+        # Get task data for execution
+        name = task.name
+        payload = task.payload
+        task_id = task.id
 
-        return True
     except Exception as e:
         session.rollback()
-        logger.error(f"Error processing task: {e}")
+        logger.error(f"Error claiming task: {e}")
         return False
     finally:
         session.close()
+
+    # Execute handler outside transaction
+    session = pq._session_factory()
+    start = time.perf_counter()
+    try:
+        handler = pq._registry.resolve(name)
+        args, kwargs = deserialize(payload)
+        _execute_handler(handler, args, kwargs, max_runtime=max_runtime)
+        elapsed = time.perf_counter() - start
+
+        # Mark as completed
+        task = session.get(Task, task_id)
+        if task:
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.now(UTC)
+            session.commit()
+
+        logger.debug(f"Task '{name}' completed in {elapsed:.3f} s")
+
+    except asyncio.TimeoutError:
+        elapsed = time.perf_counter() - start
+        task = session.get(Task, task_id)
+        if task:
+            task.status = TaskStatus.FAILED
+            task.completed_at = datetime.now(UTC)
+            task.error = f"Timed out after {elapsed:.3f} s"
+            session.commit()
+        logger.error(f"Task '{name}' timed out after {elapsed:.3f} s")
+
+    except TaskTimeoutError:
+        elapsed = time.perf_counter() - start
+        task = session.get(Task, task_id)
+        if task:
+            task.status = TaskStatus.FAILED
+            task.completed_at = datetime.now(UTC)
+            task.error = f"Timed out after {elapsed:.3f} s"
+            session.commit()
+        logger.error(f"Task '{name}' timed out after {elapsed:.3f} s")
+
+    except Exception as e:
+        elapsed = time.perf_counter() - start
+        task = session.get(Task, task_id)
+        if task:
+            task.status = TaskStatus.FAILED
+            task.completed_at = datetime.now(UTC)
+            task.error = str(e)
+            session.commit()
+        logger.error(f"Task '{name}' failed after {elapsed:.3f} s: {e}")
+
+    finally:
+        session.close()
+
+    return True
+
+
+def _calculate_next_run_cron(cron_expr: str) -> datetime:
+    """Calculate the next run time using a cron expression.
+
+    Args:
+        cron_expr: Cron expression string.
+
+    Returns:
+        The next run datetime.
+    """
+    now = datetime.now(UTC)
+    cron = croniter(cron_expr, now)
+    return cron.get_next(datetime)
 
 
 def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
@@ -180,7 +242,7 @@ def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
         stmt = (
             select(Periodic)
             .where(Periodic.next_run <= func.now())
-            .order_by(Periodic.priority, Periodic.next_run)
+            .order_by(Periodic.priority.desc(), Periodic.next_run)
             .with_for_update(skip_locked=True)
             .limit(1)
         )
@@ -193,9 +255,12 @@ def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
         name = periodic.name
         payload = periodic.payload
 
-        # Advance schedule BEFORE execution (base on now, not old next_run)
+        # Advance schedule BEFORE execution
         periodic.last_run = func.now()
-        periodic.next_run = func.now() + periodic.run_every
+        if periodic.cron:
+            periodic.next_run = _calculate_next_run_cron(periodic.cron)
+        else:
+            periodic.next_run = func.now() + periodic.run_every
         session.commit()
 
     except Exception as e:
@@ -210,7 +275,8 @@ def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
         start = time.perf_counter()
         try:
             handler = pq._registry.resolve(name)
-            _execute_handler(handler, payload, max_runtime=max_runtime)
+            args, kwargs = deserialize(payload)
+            _execute_handler(handler, args, kwargs, max_runtime=max_runtime)
             elapsed = time.perf_counter() - start
             logger.debug(f"Periodic task '{name}' completed in {elapsed:.3f} s")
         except asyncio.TimeoutError:

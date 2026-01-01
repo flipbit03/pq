@@ -1,13 +1,12 @@
 """Tests for PQ client."""
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 from pq.client import PQ
 from pq.models import Periodic, Task
 
 
-def dummy_handler(payload: dict[str, Any]) -> None:
+def dummy_handler(key: str = "") -> None:
     """Dummy handler for testing."""
     pass
 
@@ -18,7 +17,7 @@ class TestEnqueue:
     def test_enqueue_creates_task(self, pq: PQ) -> None:
         """Enqueue creates a task in the database."""
         pq.register("my_task", dummy_handler)
-        task_id = pq.enqueue("my_task", {"key": "value"})
+        task_id = pq.enqueue("my_task", key="value")
 
         assert task_id is not None
         assert pq.pending_count() == 1
@@ -26,20 +25,21 @@ class TestEnqueue:
     def test_enqueue_stores_correct_data(self, pq: PQ) -> None:
         """Enqueue stores name, payload, and run_at correctly."""
         pq.register("my_task", dummy_handler)
-        task_id = pq.enqueue("my_task", {"key": "value"})
+        task_id = pq.enqueue("my_task", key="value")
 
         with pq.session() as session:
             from sqlalchemy import select
 
             task = session.execute(select(Task).where(Task.id == task_id)).scalar_one()
             assert task.name == "my_task"
-            assert task.payload == {"key": "value"}
+            assert task.payload["args"] == []
+            assert task.payload["kwargs"] == {"key": "value"}
             assert task.run_at <= datetime.now(UTC)
 
     def test_enqueue_with_run_at(self, pq: PQ) -> None:
         """Enqueue respects custom run_at time."""
         future = datetime.now(UTC) + timedelta(hours=1)
-        task_id = pq.enqueue("my_task", {}, run_at=future)
+        task_id = pq.enqueue("my_task", run_at=future)
 
         with pq.session() as session:
             from sqlalchemy import select
@@ -50,7 +50,7 @@ class TestEnqueue:
 
     def test_enqueue_direct_function(self, pq: PQ) -> None:
         """Enqueue with callable stores function path."""
-        task_id = pq.enqueue(dummy_handler, {"key": "value"})
+        task_id = pq.enqueue(dummy_handler, key="value")
 
         with pq.session() as session:
             from sqlalchemy import select
@@ -60,7 +60,7 @@ class TestEnqueue:
 
     def test_enqueue_returns_int_id(self, pq: PQ) -> None:
         """Enqueue returns an integer ID."""
-        task_id = pq.enqueue("my_task", {})
+        task_id = pq.enqueue("my_task")
         assert isinstance(task_id, int)
         assert task_id > 0
 
@@ -79,7 +79,7 @@ class TestSchedule:
     def test_schedule_stores_correct_data(self, pq: PQ) -> None:
         """Schedule stores name, payload, and run_every correctly."""
         interval = timedelta(hours=2)
-        pq.schedule("cleanup", run_every=interval, payload={"full": True})
+        pq.schedule("cleanup", run_every=interval, full=True)
 
         with pq.session() as session:
             from sqlalchemy import select
@@ -88,7 +88,7 @@ class TestSchedule:
                 select(Periodic).where(Periodic.name == "cleanup")
             ).scalar_one()
             assert periodic.name == "cleanup"
-            assert periodic.payload == {"full": True}
+            assert periodic.payload["kwargs"] == {"full": True}
             assert periodic.run_every == interval
             assert periodic.next_run <= datetime.now(UTC)
             assert periodic.last_run is None
@@ -96,7 +96,7 @@ class TestSchedule:
     def test_schedule_upserts_existing(self, pq: PQ) -> None:
         """Scheduling same name updates existing record."""
         pq.schedule("cleanup", run_every=timedelta(hours=1))
-        pq.schedule("cleanup", run_every=timedelta(hours=2), payload={"new": True})
+        pq.schedule("cleanup", run_every=timedelta(hours=2), new=True)
 
         assert pq.periodic_count() == 1
 
@@ -107,7 +107,7 @@ class TestSchedule:
                 select(Periodic).where(Periodic.name == "cleanup")
             ).scalar_one()
             assert periodic.run_every == timedelta(hours=2)
-            assert periodic.payload == {"new": True}
+            assert periodic.payload["kwargs"] == {"new": True}
 
 
 class TestCancel:
@@ -115,7 +115,7 @@ class TestCancel:
 
     def test_cancel_removes_task(self, pq: PQ) -> None:
         """Cancel removes task from database."""
-        task_id = pq.enqueue("my_task", {})
+        task_id = pq.enqueue("my_task")
         assert pq.pending_count() == 1
 
         result = pq.cancel(task_id)
@@ -155,7 +155,7 @@ class TestTaskDecorator:
         """Decorator registers handler in registry."""
 
         @pq.task("decorated_task")
-        def my_handler(payload: dict[str, Any]) -> None:
+        def my_handler(value: int) -> None:
             pass
 
         handler = pq._registry.get("decorated_task")
@@ -165,7 +165,7 @@ class TestTaskDecorator:
         """Decorator returns original function unchanged."""
 
         @pq.task("decorated_task")
-        def my_handler(payload: dict[str, Any]) -> None:
+        def my_handler(value: int) -> None:
             pass
 
         assert my_handler.__name__ == "my_handler"

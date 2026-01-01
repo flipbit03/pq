@@ -5,14 +5,16 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from croniter import croniter
 from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
-from pq.models import Base, Periodic, Task
+from pq.models import Base, Periodic, Task, TaskStatus
 from pq.priority import Priority
 from pq.registry import TaskRegistry, get_function_path
+from pq.serialization import serialize
 
 
 class PQ:
@@ -71,30 +73,31 @@ class PQ:
 
         return decorator
 
-    def register(self, name: str, handler: Callable[[dict[str, Any]], None]) -> None:
+    def register(self, name: str, handler: Callable[..., Any]) -> None:
         """Register a task handler explicitly.
 
         Args:
             name: Task name.
-            handler: Function to call with payload.
+            handler: Function to call with task arguments.
         """
         self._registry.register(name, handler)
 
     def enqueue(
         self,
         task: str | Callable[..., Any],
-        payload: dict[str, Any] | None = None,
-        *,
+        *args: Any,
         run_at: datetime | None = None,
         priority: Priority = Priority.NORMAL,
+        **kwargs: Any,
     ) -> int:
         """Enqueue a one-off task.
 
         Args:
             task: Task name (string) or callable function.
-            payload: Data to pass to the task handler.
+            *args: Positional arguments to pass to the handler.
             run_at: When to run the task. Defaults to now.
-            priority: Task priority. Lower = higher priority. Defaults to NORMAL.
+            priority: Task priority. Higher = higher priority. Defaults to NORMAL.
+            **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
             Task ID.
@@ -104,8 +107,7 @@ class PQ:
         else:
             name = task
 
-        if payload is None:
-            payload = {}
+        payload = serialize(args, kwargs)
 
         if run_at is None:
             run_at = datetime.now(UTC)
@@ -120,28 +122,45 @@ class PQ:
     def schedule(
         self,
         name: str,
-        *,
-        run_every: timedelta,
-        payload: dict[str, Any] | None = None,
+        *args: Any,
+        run_every: timedelta | None = None,
+        cron: str | None = None,
         priority: Priority = Priority.NORMAL,
+        **kwargs: Any,
     ) -> int:
         """Schedule a periodic task.
 
         If a periodic task with this name already exists, it will be updated.
+        Either run_every or cron must be provided, but not both.
 
         Args:
             name: Task name.
-            run_every: Interval between executions.
-            payload: Data to pass to the task handler.
-            priority: Task priority. Lower = higher priority. Defaults to NORMAL.
+            *args: Positional arguments to pass to the handler.
+            run_every: Interval between executions (e.g., timedelta(hours=1)).
+            cron: Cron expression (e.g., "0 9 * * 1" for Monday 9am).
+            priority: Task priority. Higher = higher priority. Defaults to NORMAL.
+            **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
             Periodic task ID.
-        """
-        if payload is None:
-            payload = {}
 
-        next_run = datetime.now(UTC)
+        Raises:
+            ValueError: If neither run_every nor cron is provided, or if both are.
+        """
+        if run_every is None and cron is None:
+            raise ValueError("Either run_every or cron must be provided")
+        if run_every is not None and cron is not None:
+            raise ValueError("Only one of run_every or cron can be provided")
+
+        payload = serialize(args, kwargs)
+
+        # Calculate next_run based on cron or interval
+        now = datetime.now(UTC)
+        if cron:
+            cron_iter = croniter(cron, now)
+            next_run = cron_iter.get_next(datetime)
+        else:
+            next_run = now
 
         with self.session() as session:
             stmt = (
@@ -151,6 +170,7 @@ class PQ:
                     payload=payload,
                     priority=priority,
                     run_every=run_every,
+                    cron=cron,
                     next_run=next_run,
                 )
                 .on_conflict_do_update(
@@ -159,6 +179,7 @@ class PQ:
                         "payload": payload,
                         "priority": priority,
                         "run_every": run_every,
+                        "cron": cron,
                         "next_run": next_run,
                     },
                 )
@@ -198,7 +219,11 @@ class PQ:
     def pending_count(self) -> int:
         """Count pending one-off tasks."""
         with self.session() as session:
-            result = session.execute(select(func.count()).select_from(Task))
+            result = session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(Task.status == TaskStatus.PENDING)
+            )
             return result.scalar_one()
 
     def periodic_count(self) -> int:
@@ -206,6 +231,86 @@ class PQ:
         with self.session() as session:
             result = session.execute(select(func.count()).select_from(Periodic))
             return result.scalar_one()
+
+    def get_task(self, task_id: int) -> Task | None:
+        """Get a task by ID.
+
+        Args:
+            task_id: Task ID.
+
+        Returns:
+            Task object or None if not found.
+        """
+        with self.session() as session:
+            return session.get(Task, task_id)
+
+    def list_failed(self, limit: int = 100) -> list[Task]:
+        """List failed tasks.
+
+        Args:
+            limit: Maximum number of tasks to return.
+
+        Returns:
+            List of failed tasks, most recent first.
+        """
+        with self.session() as session:
+            stmt = (
+                select(Task)
+                .where(Task.status == TaskStatus.FAILED)
+                .order_by(Task.completed_at.desc())
+                .limit(limit)
+            )
+            return list(session.execute(stmt).scalars().all())
+
+    def list_completed(self, limit: int = 100) -> list[Task]:
+        """List completed tasks.
+
+        Args:
+            limit: Maximum number of tasks to return.
+
+        Returns:
+            List of completed tasks, most recent first.
+        """
+        with self.session() as session:
+            stmt = (
+                select(Task)
+                .where(Task.status == TaskStatus.COMPLETED)
+                .order_by(Task.completed_at.desc())
+                .limit(limit)
+            )
+            return list(session.execute(stmt).scalars().all())
+
+    def clear_completed(self, before: datetime | None = None) -> int:
+        """Clear completed tasks.
+
+        Args:
+            before: Only clear tasks completed before this time. If None, clears all.
+
+        Returns:
+            Number of tasks deleted.
+        """
+        with self.session() as session:
+            stmt = delete(Task).where(Task.status == TaskStatus.COMPLETED)
+            if before is not None:
+                stmt = stmt.where(Task.completed_at < before)
+            result = session.execute(stmt)
+            return result.rowcount
+
+    def clear_failed(self, before: datetime | None = None) -> int:
+        """Clear failed tasks.
+
+        Args:
+            before: Only clear tasks failed before this time. If None, clears all.
+
+        Returns:
+            Number of tasks deleted.
+        """
+        with self.session() as session:
+            stmt = delete(Task).where(Task.status == TaskStatus.FAILED)
+            if before is not None:
+                stmt = stmt.where(Task.completed_at < before)
+            result = session.execute(stmt)
+            return result.rowcount
 
     def run_worker(
         self, *, poll_interval: float = 1.0, max_runtime: float = 30 * 60

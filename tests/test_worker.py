@@ -9,12 +9,12 @@ from pq.models import Periodic
 from pq.priority import Priority
 
 # Global handler for testing direct function import - must be defined before use
-tracked_handler_calls: list[dict[str, Any]] = []
+tracked_handler_calls: list[tuple[Any, ...]] = []
 
 
-def tracked_handler(payload: dict[str, Any]) -> None:
+def tracked_handler(key: str) -> None:
     """Handler that tracks calls for testing."""
-    tracked_handler_calls.append(payload)
+    tracked_handler_calls.append((key,))
 
 
 class TestRunWorkerOnce:
@@ -22,26 +22,26 @@ class TestRunWorkerOnce:
 
     def test_processes_pending_task(self, pq: PQ) -> None:
         """Worker processes a pending task."""
-        results: list[dict[str, Any]] = []
+        results: list[int] = []
 
         @pq.task("capture")
-        def capture(payload: dict[str, Any]) -> None:
-            results.append(payload)
+        def capture(value: int) -> None:
+            results.append(value)
 
-        pq.enqueue("capture", {"value": 42})
+        pq.enqueue("capture", value=42)
         processed = pq.run_worker_once()
 
         assert processed is True
-        assert results == [{"value": 42}]
+        assert results == [42]
 
     def test_deletes_task_after_processing(self, pq: PQ) -> None:
-        """Worker deletes task after processing."""
+        """Worker marks task completed after processing."""
 
         @pq.task("my_task")
-        def handler(payload: dict[str, Any]) -> None:
+        def handler() -> None:
             pass
 
-        pq.enqueue("my_task", {})
+        pq.enqueue("my_task")
         assert pq.pending_count() == 1
 
         pq.run_worker_once()
@@ -53,11 +53,11 @@ class TestRunWorkerOnce:
         results: list[Any] = []
 
         @pq.task("future_task")
-        def handler(payload: dict[str, Any]) -> None:
+        def handler() -> None:
             results.append(1)
 
         future = datetime.now(UTC) + timedelta(hours=1)
-        pq.enqueue("future_task", {}, run_at=future)
+        pq.enqueue("future_task", run_at=future)
 
         processed = pq.run_worker_once()
 
@@ -71,13 +71,13 @@ class TestRunWorkerOnce:
         assert processed is False
 
     def test_deletes_task_on_failure(self, pq: PQ) -> None:
-        """Worker deletes task even when handler fails."""
+        """Worker marks task failed when handler fails."""
 
         @pq.task("failing_task")
-        def handler(payload: dict[str, Any]) -> None:
+        def handler() -> None:
             raise ValueError("boom")
 
-        pq.enqueue("failing_task", {})
+        pq.enqueue("failing_task")
         assert pq.pending_count() == 1
 
         pq.run_worker_once()
@@ -88,23 +88,23 @@ class TestRunWorkerOnce:
         """Worker can process task with direct function path."""
         tracked_handler_calls.clear()
 
-        pq.enqueue(tracked_handler, {"key": "value"})
+        pq.enqueue(tracked_handler, key="value")
         pq.run_worker_once()
 
-        assert tracked_handler_calls == [{"key": "value"}]
+        assert tracked_handler_calls == [("value",)]
 
     def test_processes_higher_priority_first(self, pq: PQ) -> None:
         """Worker processes higher priority tasks first."""
         results: list[int] = []
 
         @pq.task("ordered")
-        def handler(payload: dict[str, Any]) -> None:
-            results.append(payload["n"])
+        def handler(n: int) -> None:
+            results.append(n)
 
         # Enqueue in reverse priority order
-        pq.enqueue("ordered", {"n": 3}, priority=Priority.LOW)
-        pq.enqueue("ordered", {"n": 1}, priority=Priority.HIGH)
-        pq.enqueue("ordered", {"n": 2}, priority=Priority.NORMAL)
+        pq.enqueue("ordered", n=3, priority=Priority.LOW)
+        pq.enqueue("ordered", n=1, priority=Priority.HIGH)
+        pq.enqueue("ordered", n=2, priority=Priority.NORMAL)
 
         pq.run_worker_once()
         pq.run_worker_once()
@@ -119,25 +119,25 @@ class TestPeriodicTasks:
 
     def test_processes_periodic_task(self, pq: PQ) -> None:
         """Worker processes a periodic task."""
-        results: list[dict[str, Any]] = []
+        results: list[int] = []
 
         @pq.task("periodic")
-        def handler(payload: dict[str, Any]) -> None:
-            results.append(payload)
+        def handler(n: int) -> None:
+            results.append(n)
 
-        pq.schedule("periodic", run_every=timedelta(hours=1), payload={"n": 1})
+        pq.schedule("periodic", run_every=timedelta(hours=1), n=1)
 
         processed = pq.run_worker_once()
 
         assert processed is True
-        assert results == [{"n": 1}]
+        assert results == [1]
 
     def test_advances_next_run(self, pq: PQ) -> None:
         """Worker advances next_run after processing."""
         from sqlalchemy import select
 
         @pq.task("periodic")
-        def handler(payload: dict[str, Any]) -> None:
+        def handler() -> None:
             pass
 
         pq.schedule("periodic", run_every=timedelta(hours=1))
@@ -164,7 +164,7 @@ class TestPeriodicTasks:
         from sqlalchemy import select
 
         @pq.task("periodic")
-        def handler(payload: dict[str, Any]) -> None:
+        def handler() -> None:
             pass
 
         pq.schedule("periodic", run_every=timedelta(hours=1))
@@ -190,7 +190,7 @@ class TestPeriodicTasks:
         results: list[Any] = []
 
         @pq.task("periodic")
-        def handler(payload: dict[str, Any]) -> None:
+        def handler() -> None:
             results.append(1)
 
         pq.schedule("periodic", run_every=timedelta(hours=1))
@@ -213,7 +213,7 @@ class TestPeriodicTasks:
         results: list[int] = []
 
         @pq.task("counter")
-        def counter(payload: dict[str, Any]) -> None:
+        def counter() -> None:
             results.append(1)
 
         # Schedule with 0 interval so it's always ready
@@ -231,7 +231,7 @@ class TestPeriodicTasks:
         from sqlalchemy import select
 
         @pq.task("failing")
-        def handler(payload: dict[str, Any]) -> None:
+        def handler() -> None:
             raise ValueError("boom")
 
         pq.schedule("failing", run_every=timedelta(hours=1))
@@ -257,7 +257,7 @@ class TestPeriodicTasks:
         count: list[int] = []
 
         @pq.task("overdue")
-        def handler(payload: dict[str, Any]) -> None:
+        def handler() -> None:
             count.append(1)
 
         # Schedule with 1 hour interval
@@ -285,49 +285,49 @@ class TestAsyncTasks:
 
     def test_processes_async_one_off_task(self, pq: PQ) -> None:
         """Worker processes an async one-off task."""
-        results: list[dict[str, Any]] = []
+        results: list[str] = []
 
         @pq.task("async_task")
-        async def async_handler(payload: dict[str, Any]) -> None:
+        async def async_handler(value: str) -> None:
             await asyncio.sleep(0.01)  # Simulate async work
-            results.append(payload)
+            results.append(value)
 
-        pq.enqueue("async_task", {"value": "async_test"})
+        pq.enqueue("async_task", value="async_test")
         processed = pq.run_worker_once()
 
         assert processed is True
-        assert results == [{"value": "async_test"}]
+        assert results == ["async_test"]
 
     def test_processes_async_periodic_task(self, pq: PQ) -> None:
         """Worker processes an async periodic task."""
-        results: list[dict[str, Any]] = []
+        results: list[int] = []
 
         @pq.task("async_periodic")
-        async def async_handler(payload: dict[str, Any]) -> None:
+        async def async_handler(n: int) -> None:
             await asyncio.sleep(0.01)
-            results.append(payload)
+            results.append(n)
 
-        pq.schedule("async_periodic", run_every=timedelta(hours=1), payload={"n": 1})
+        pq.schedule("async_periodic", run_every=timedelta(hours=1), n=1)
 
         processed = pq.run_worker_once()
 
         assert processed is True
-        assert results == [{"n": 1}]
+        assert results == [1]
 
     def test_async_task_failure_handled(self, pq: PQ) -> None:
         """Worker handles async task failures correctly."""
 
         @pq.task("async_failing")
-        async def async_handler(payload: dict[str, Any]) -> None:
+        async def async_handler() -> None:
             await asyncio.sleep(0.01)
             raise ValueError("async boom")
 
-        pq.enqueue("async_failing", {})
+        pq.enqueue("async_failing")
         assert pq.pending_count() == 1
 
         pq.run_worker_once()
 
-        # Task should be deleted even on failure
+        # Task should be marked as failed
         assert pq.pending_count() == 0
 
 
@@ -339,11 +339,11 @@ class TestTaskTimeout:
         results: list[str] = []
 
         @pq.task("slow_async")
-        async def slow_handler(payload: dict[str, Any]) -> None:
+        async def slow_handler() -> None:
             await asyncio.sleep(10)  # Would take 10 seconds
             results.append("completed")
 
-        pq.enqueue("slow_async", {})
+        pq.enqueue("slow_async")
         # Use 0.1 second timeout - task should timeout
         pq.run_worker_once(max_runtime=0.1)
 
@@ -359,11 +359,11 @@ class TestTaskTimeout:
         results: list[str] = []
 
         @pq.task("slow_sync")
-        def slow_handler(payload: dict[str, Any]) -> None:
+        def slow_handler() -> None:
             time.sleep(10)  # Would take 10 seconds
             results.append("completed")
 
-        pq.enqueue("slow_sync", {})
+        pq.enqueue("slow_sync")
         # Use 1 second timeout (SIGALRM has 1-second granularity)
         pq.run_worker_once(max_runtime=1)
 
