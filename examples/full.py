@@ -55,13 +55,13 @@ Usage:
 
 === PRIORITY ===
 
-1. Using Priority enum:
+Priority levels (lower value = higher priority):
     from pq import Priority
-    pq.enqueue("task", payload, priority=Priority.HIGH)
-
-2. Using raw integers (lower = higher priority):
-    pq.enqueue("urgent", payload, priority=-10)  # Runs before priority=0
-    pq.enqueue("batch", payload, priority=10)    # Runs after priority=0
+    pq.enqueue("task", payload, priority=Priority.CRITICAL)  # -20
+    pq.enqueue("task", payload, priority=Priority.HIGH)      # -10
+    pq.enqueue("task", payload, priority=Priority.NORMAL)    # 0 (default)
+    pq.enqueue("task", payload, priority=Priority.LOW)       # 10
+    pq.enqueue("task", payload, priority=Priority.BATCH)     # 20
 """
 
 import sys
@@ -117,6 +117,13 @@ def report(payload: dict) -> None:
     logger.info(f"📊 Generating {payload.get('type', 'default')} report...")
 
 
+@pq.task("flaky")
+def flaky_task(payload: dict) -> None:
+    """Task that fails - demonstrates error handling."""
+    logger.info("💥 About to fail...")
+    raise ValueError(f"Simulated error: {payload.get('reason', 'unknown')}")
+
+
 # Method 2: Explicit registration
 def send_email(payload: dict) -> None:
     """Email task registered explicitly."""
@@ -147,10 +154,10 @@ def cmd_full() -> None:
 
     # Start fresh
     pq.clear_all()
-    logger.info("[1/7] CLEARED - Starting fresh")
+    logger.info("[1/8] CLEARED - Starting fresh")
 
     # === Registration Methods ===
-    logger.info("[2/7] REGISTRATION METHODS")
+    logger.info("[2/8] REGISTRATION METHODS")
     logger.info("-" * 40)
     logger.info("✓ @pq.task('greet') - Decorator registration")
     logger.info("✓ pq.register('send_email', fn) - Explicit registration")
@@ -159,7 +166,7 @@ def cmd_full() -> None:
     logger.info("")
 
     # === One-off Tasks ===
-    logger.info("[3/7] ENQUEUEING ONE-OFF TASKS")
+    logger.info("[3/8] ENQUEUEING ONE-OFF TASKS")
     logger.info("-" * 40)
 
     # By name (decorator-registered)
@@ -185,7 +192,7 @@ def cmd_full() -> None:
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Delayed Task ===
-    logger.info("[4/7] DELAYED TASK (run_at)")
+    logger.info("[4/8] DELAYED TASK (run_at)")
     logger.info("-" * 40)
     run_at = datetime.now(UTC) + timedelta(seconds=3)
     id6 = pq.enqueue("greet", {"name": "Future"}, run_at=run_at)
@@ -193,7 +200,7 @@ def cmd_full() -> None:
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Cancellation ===
-    logger.info("[5/7] TASK CANCELLATION")
+    logger.info("[5/8] TASK CANCELLATION")
     logger.info("-" * 40)
     cancel_id = pq.enqueue("greet", {"name": "WillBeCancelled"})
     logger.info(f"Enqueued task -> id={cancel_id}")
@@ -202,8 +209,16 @@ def cmd_full() -> None:
     logger.info(f"Cancelled task -> id={cancel_id}")
     logger.info(f"Pending after cancel: {pq.pending_count()}\n")
 
+    # === Error Handling ===
+    logger.info("[6/8] ERROR HANDLING")
+    logger.info("-" * 40)
+    pq.enqueue("flaky", {"reason": "demo failure"})
+    logger.info("Enqueued flaky task (will fail)")
+    pq.run_worker_once()  # This will log the error but continue
+    logger.info("Worker continued after error (task removed)\n")
+
     # === Periodic Tasks ===
-    logger.info("[6/7] PERIODIC TASKS")
+    logger.info("[7/8] PERIODIC TASKS")
     logger.info("-" * 40)
     pq.schedule("tick", run_every=timedelta(seconds=2))
     logger.info("Scheduled 'tick' every 2 seconds")
@@ -212,7 +227,7 @@ def cmd_full() -> None:
     logger.info(f"Periodic count: {pq.periodic_count()}\n")
 
     # === Process Everything ===
-    logger.info("[7/7] PROCESSING")
+    logger.info("[8/8] PROCESSING")
     logger.info("-" * 40)
     logger.info("Processing one-off tasks...")
 

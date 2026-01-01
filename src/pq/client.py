@@ -11,6 +11,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 from pq.models import Base, Periodic, Task
+from pq.priority import Priority
 from pq.registry import TaskRegistry, get_function_path
 
 
@@ -85,7 +86,7 @@ class PQ:
         payload: dict[str, Any] | None = None,
         *,
         run_at: datetime | None = None,
-        priority: int = 0,
+        priority: Priority = Priority.NORMAL,
     ) -> int:
         """Enqueue a one-off task.
 
@@ -93,7 +94,7 @@ class PQ:
             task: Task name (string) or callable function.
             payload: Data to pass to the task handler.
             run_at: When to run the task. Defaults to now.
-            priority: Task priority. Lower = higher priority. Defaults to 0.
+            priority: Task priority. Lower = higher priority. Defaults to NORMAL.
 
         Returns:
             Task ID.
@@ -122,7 +123,7 @@ class PQ:
         *,
         run_every: timedelta,
         payload: dict[str, Any] | None = None,
-        priority: int = 0,
+        priority: Priority = Priority.NORMAL,
     ) -> int:
         """Schedule a periodic task.
 
@@ -132,7 +133,7 @@ class PQ:
             name: Task name.
             run_every: Interval between executions.
             payload: Data to pass to the task handler.
-            priority: Task priority. Lower = higher priority. Defaults to 0.
+            priority: Task priority. Lower = higher priority. Defaults to NORMAL.
 
         Returns:
             Periodic task ID.

@@ -5,6 +5,7 @@ from typing import Any
 
 from pq.client import PQ
 from pq.models import Periodic
+from pq.priority import Priority
 
 # Global handler for testing direct function import - must be defined before use
 tracked_handler_calls: list[dict[str, Any]] = []
@@ -100,15 +101,15 @@ class TestRunWorkerOnce:
             results.append(payload["n"])
 
         # Enqueue in reverse priority order
-        pq.enqueue("ordered", {"n": 3}, priority=10)  # Low priority
-        pq.enqueue("ordered", {"n": 1}, priority=-10)  # High priority
-        pq.enqueue("ordered", {"n": 2}, priority=0)  # Normal priority
+        pq.enqueue("ordered", {"n": 3}, priority=Priority.LOW)
+        pq.enqueue("ordered", {"n": 1}, priority=Priority.HIGH)
+        pq.enqueue("ordered", {"n": 2}, priority=Priority.NORMAL)
 
         pq.run_worker_once()
         pq.run_worker_once()
         pq.run_worker_once()
 
-        # Should process in priority order: high (-10), normal (0), low (10)
+        # Should process in priority order: HIGH, NORMAL, LOW
         assert results == [1, 2, 3]
 
 
