@@ -1,12 +1,18 @@
-"""Worker loop for processing tasks."""
+"""Worker loop for processing tasks with fork isolation.
+
+Each task runs in a forked child process for memory isolation.
+If a task OOMs or crashes, only the child is affected - the worker continues.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import signal
-import threading
+import sys
 import time
+import traceback
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -25,38 +31,198 @@ if TYPE_CHECKING:
 # Default max runtime: 30 minutes
 DEFAULT_MAX_RUNTIME: float = 30 * 60
 
+# Exit codes for child process
+EXIT_SUCCESS = 0
+EXIT_FAILURE = 1
+EXIT_TIMEOUT = 124  # Like GNU timeout
 
-class TaskTimeoutError(Exception):
+
+class WorkerError(Exception):
+    """Base class for worker errors."""
+
+    pass
+
+
+class TaskTimeoutError(WorkerError):
     """Raised when a task exceeds its max runtime."""
 
     pass
 
 
-def _timeout_handler(signum: int, frame: Any) -> None:
-    """Signal handler for task timeout."""
+class TaskOOMError(WorkerError):
+    """Raised when a task is killed by OOM killer."""
+
+    pass
+
+
+class TaskKilledError(WorkerError):
+    """Raised when a task is killed by a signal."""
+
+    pass
+
+
+def _child_timeout_handler(signum: int, frame: Any) -> None:
+    """Signal handler for timeout in child process."""
+    os._exit(EXIT_TIMEOUT)
+
+
+def _direct_timeout_handler(signum: int, frame: Any) -> None:
+    """Signal handler for timeout in direct (non-fork) execution."""
     raise TaskTimeoutError("Task exceeded max runtime")
 
 
-def _execute_handler(
+def _run_in_child(
+    handler: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    max_runtime: float,
+    error_write_fd: int,
+) -> None:
+    """Execute handler in child process.
+
+    This function never returns - it always calls os._exit().
+    """
+    # Create new process group so we don't get parent's signals
+    os.setpgrp()
+
+    # Set up timeout
+    signal.signal(signal.SIGALRM, _child_timeout_handler)
+    signal.alarm(int(max_runtime) + 1)  # +1 buffer for async timeout
+
+    try:
+        if inspect.iscoroutinefunction(handler):
+            asyncio.run(asyncio.wait_for(handler(*args, **kwargs), timeout=max_runtime))
+        else:
+            handler(*args, **kwargs)
+        os._exit(EXIT_SUCCESS)
+
+    except asyncio.TimeoutError:
+        os._exit(EXIT_TIMEOUT)
+
+    except Exception as e:
+        # Send error message to parent via pipe
+        try:
+            error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            os.write(error_write_fd, error_msg.encode("utf-8", errors="replace"))
+        except Exception:
+            pass  # Best effort
+        os._exit(EXIT_FAILURE)
+
+
+def _execute_in_fork(
     handler: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     *,
     max_runtime: float,
 ) -> None:
-    """Execute a handler, supporting both sync and async functions with timeout.
+    """Execute handler in a forked child process for isolation.
+
+    The child process has isolated memory, so OOM or crashes only affect
+    the child. Parent monitors via os.wait4() and handles various exit
+    scenarios.
 
     Args:
         handler: Task handler function.
         args: Positional arguments for handler.
         kwargs: Keyword arguments for handler.
         max_runtime: Maximum execution time in seconds.
+
+    Raises:
+        TaskTimeoutError: If task exceeds max runtime.
+        TaskOOMError: If task is killed by OOM killer (SIGKILL).
+        TaskKilledError: If task is killed by another signal.
+        Exception: If task raises an exception.
     """
+    # Create pipe for error message communication
+    read_fd, write_fd = os.pipe()
+
+    child_pid = os.fork()
+
+    if child_pid == 0:
+        # === CHILD PROCESS ===
+        os.close(read_fd)
+        _run_in_child(handler, args, kwargs, max_runtime, write_fd)
+        # _run_in_child never returns, but just in case:
+        os._exit(EXIT_FAILURE)
+
+    else:
+        # === PARENT PROCESS ===
+        os.close(write_fd)
+
+        # Wait for child to finish
+        _, status, rusage = os.wait4(child_pid, 0)
+
+        # Read any error message from child
+        error_bytes = b""
+        try:
+            while True:
+                chunk = os.read(read_fd, 4096)
+                if not chunk:
+                    break
+                error_bytes += chunk
+        except Exception:
+            pass
+        finally:
+            os.close(read_fd)
+
+        error_msg = error_bytes.decode("utf-8", errors="replace") if error_bytes else ""
+
+        # Check how child exited
+        if os.WIFSIGNALED(status):
+            signal_num = os.WTERMSIG(status)
+            if signal_num == signal.SIGKILL:
+                # SIGKILL (9) often means OOM killer
+                # ru_maxrss is in KB on Linux, bytes on macOS
+                max_rss_kb = rusage.ru_maxrss
+                if sys.platform == "darwin":
+                    max_rss_kb = max_rss_kb // 1024
+                raise TaskOOMError(
+                    f"Task killed (likely OOM). Max RSS: {max_rss_kb} KB"
+                )
+            else:
+                raise TaskKilledError(f"Task killed by signal {signal_num}")
+
+        elif os.WIFEXITED(status):
+            exit_code = os.WEXITSTATUS(status)
+            if exit_code == EXIT_SUCCESS:
+                return  # Success!
+            elif exit_code == EXIT_TIMEOUT:
+                raise TaskTimeoutError("Task exceeded max runtime")
+            else:
+                # Task raised an exception
+                if error_msg:
+                    raise Exception(error_msg.split("\n")[0])  # First line
+                else:
+                    raise Exception(f"Task failed with exit code {exit_code}")
+
+
+def _execute_handler_direct(
+    handler: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    max_runtime: float,
+) -> None:
+    """Execute handler directly without fork (for testing only).
+
+    Args:
+        handler: Task handler function.
+        args: Positional arguments for handler.
+        kwargs: Keyword arguments for handler.
+        max_runtime: Maximum execution time in seconds.
+
+    Raises:
+        TaskTimeoutError: If task exceeds max runtime.
+        Exception: If task raises an exception.
+    """
+    import threading
+
     if inspect.iscoroutinefunction(handler):
         asyncio.run(asyncio.wait_for(handler(*args, **kwargs), timeout=max_runtime))
     elif threading.current_thread() is threading.main_thread():
-        # Use SIGALRM for sync timeout (Unix only, main thread only)
-        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        # Use SIGALRM for timeout (only works in main thread)
+        old_handler = signal.signal(signal.SIGALRM, _direct_timeout_handler)
         signal.alarm(int(max_runtime))
         try:
             handler(*args, **kwargs)
@@ -64,30 +230,39 @@ def _execute_handler(
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
     else:
-        # In non-main threads, run without timeout (signals not available)
+        # In non-main threads, run without signal-based timeout
         handler(*args, **kwargs)
 
 
 def run_worker(
-    pq: PQ, *, poll_interval: float = 1.0, max_runtime: float = DEFAULT_MAX_RUNTIME
+    pq: PQ,
+    *,
+    poll_interval: float = 1.0,
+    max_runtime: float = DEFAULT_MAX_RUNTIME,
+    _no_fork: bool = False,
 ) -> None:
     """Run the worker loop indefinitely.
+
+    Each task executes in a forked child process for memory isolation.
 
     Args:
         pq: PQ client instance.
         poll_interval: Seconds to sleep between polls when idle.
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
+        _no_fork: Internal testing flag. Do not use in production.
     """
-    logger.info("Starting PQ worker...")
+    logger.info("Starting PQ worker (fork isolation enabled)...")
     try:
         while True:
-            if not run_worker_once(pq, max_runtime=max_runtime):
+            if not run_worker_once(pq, max_runtime=max_runtime, _no_fork=_no_fork):
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Worker stopped.")
 
 
-def run_worker_once(pq: PQ, *, max_runtime: float = DEFAULT_MAX_RUNTIME) -> bool:
+def run_worker_once(
+    pq: PQ, *, max_runtime: float = DEFAULT_MAX_RUNTIME, _no_fork: bool = False
+) -> bool:
     """Process a single task if available.
 
     Checks one-off tasks first, then periodic tasks.
@@ -95,27 +270,31 @@ def run_worker_once(pq: PQ, *, max_runtime: float = DEFAULT_MAX_RUNTIME) -> bool
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
+        _no_fork: Internal testing flag. Do not use in production.
 
     Returns:
         True if a task was processed, False if queue was empty.
     """
     # Try one-off task first
-    if _process_one_off_task(pq, max_runtime=max_runtime):
+    if _process_one_off_task(pq, max_runtime=max_runtime, _no_fork=_no_fork):
         return True
 
     # Try periodic task
-    if _process_periodic_task(pq, max_runtime=max_runtime):
+    if _process_periodic_task(pq, max_runtime=max_runtime, _no_fork=_no_fork):
         return True
 
     return False
 
 
-def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
+def _process_one_off_task(
+    pq: PQ, *, max_runtime: float, _no_fork: bool = False
+) -> bool:
     """Claim and process a one-off task.
 
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time in seconds.
+        _no_fork: If True, run handler directly without fork.
 
     Returns:
         True if a task was processed.
@@ -155,13 +334,14 @@ def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
     finally:
         session.close()
 
-    # Execute handler outside transaction
+    # Execute handler (forked unless _no_fork)
+    execute_fn = _execute_handler_direct if _no_fork else _execute_in_fork
     session = pq._session_factory()
     start = time.perf_counter()
     try:
         handler = pq._registry.resolve(name)
         args, kwargs = deserialize(payload)
-        _execute_handler(handler, args, kwargs, max_runtime=max_runtime)
+        execute_fn(handler, args, kwargs, max_runtime=max_runtime)
         elapsed = time.perf_counter() - start
 
         # Mark as completed
@@ -173,16 +353,6 @@ def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
 
         logger.debug(f"Task '{name}' completed in {elapsed:.3f} s")
 
-    except asyncio.TimeoutError:
-        elapsed = time.perf_counter() - start
-        task = session.get(Task, task_id)
-        if task:
-            task.status = TaskStatus.FAILED
-            task.completed_at = datetime.now(UTC)
-            task.error = f"Timed out after {elapsed:.3f} s"
-            session.commit()
-        logger.error(f"Task '{name}' timed out after {elapsed:.3f} s")
-
     except TaskTimeoutError:
         elapsed = time.perf_counter() - start
         task = session.get(Task, task_id)
@@ -192,6 +362,26 @@ def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
             task.error = f"Timed out after {elapsed:.3f} s"
             session.commit()
         logger.error(f"Task '{name}' timed out after {elapsed:.3f} s")
+
+    except TaskOOMError as e:
+        elapsed = time.perf_counter() - start
+        task = session.get(Task, task_id)
+        if task:
+            task.status = TaskStatus.FAILED
+            task.completed_at = datetime.now(UTC)
+            task.error = str(e)
+            session.commit()
+        logger.error(f"Task '{name}' OOM after {elapsed:.3f} s: {e}")
+
+    except TaskKilledError as e:
+        elapsed = time.perf_counter() - start
+        task = session.get(Task, task_id)
+        if task:
+            task.status = TaskStatus.FAILED
+            task.completed_at = datetime.now(UTC)
+            task.error = str(e)
+            session.commit()
+        logger.error(f"Task '{name}' killed after {elapsed:.3f} s: {e}")
 
     except Exception as e:
         elapsed = time.perf_counter() - start
@@ -223,12 +413,15 @@ def _calculate_next_run_cron(cron_expr: str) -> datetime:
     return cron.get_next(datetime)
 
 
-def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
+def _process_periodic_task(
+    pq: PQ, *, max_runtime: float, _no_fork: bool = False
+) -> bool:
     """Claim and process a periodic task.
 
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time in seconds.
+        _no_fork: If True, run handler directly without fork.
 
     Returns:
         True if a task was processed.
@@ -270,24 +463,33 @@ def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
     finally:
         session.close()
 
-    # Execute handler outside transaction
+    # Execute handler (forked unless _no_fork)
+    execute_fn = _execute_handler_direct if _no_fork else _execute_in_fork
     if name is not None:
         start = time.perf_counter()
         try:
             handler = pq._registry.resolve(name)
             args, kwargs = deserialize(payload)
-            _execute_handler(handler, args, kwargs, max_runtime=max_runtime)
+            execute_fn(handler, args, kwargs, max_runtime=max_runtime)
             elapsed = time.perf_counter() - start
             logger.debug(f"Periodic task '{name}' completed in {elapsed:.3f} s")
-        except asyncio.TimeoutError:
-            elapsed = time.perf_counter() - start
-            logger.error(f"Periodic task '{name}' timed out after {elapsed:.3f} s")
+
         except TaskTimeoutError:
             elapsed = time.perf_counter() - start
             logger.error(f"Periodic task '{name}' timed out after {elapsed:.3f} s")
+
+        except TaskOOMError as e:
+            elapsed = time.perf_counter() - start
+            logger.error(f"Periodic task '{name}' OOM after {elapsed:.3f} s: {e}")
+
+        except TaskKilledError as e:
+            elapsed = time.perf_counter() - start
+            logger.error(f"Periodic task '{name}' killed after {elapsed:.3f} s: {e}")
+
         except Exception as e:
             elapsed = time.perf_counter() - start
             logger.error(f"Periodic task '{name}' failed after {elapsed:.3f} s: {e}")
+
         return True
 
     return False

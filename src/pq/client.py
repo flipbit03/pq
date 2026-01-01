@@ -313,27 +313,40 @@ class PQ:
             return result.rowcount
 
     def run_worker(
-        self, *, poll_interval: float = 1.0, max_runtime: float = 30 * 60
+        self,
+        *,
+        poll_interval: float = 1.0,
+        max_runtime: float = 30 * 60,
+        _no_fork: bool = False,
     ) -> None:
         """Run the worker loop (blocking).
 
         Args:
             poll_interval: Seconds to sleep between polls when idle.
             max_runtime: Maximum execution time per task in seconds. Default: 30 min.
+            _no_fork: Internal testing flag. Do not use in production.
         """
         from pq.worker import run_worker
 
-        run_worker(self, poll_interval=poll_interval, max_runtime=max_runtime)
+        run_worker(
+            self,
+            poll_interval=poll_interval,
+            max_runtime=max_runtime,
+            _no_fork=_no_fork,
+        )
 
-    def run_worker_once(self, *, max_runtime: float = 30 * 60) -> bool:
+    def run_worker_once(
+        self, *, max_runtime: float = 30 * 60, _no_fork: bool = False
+    ) -> bool:
         """Process a single task if available.
 
         Args:
             max_runtime: Maximum execution time per task in seconds. Default: 30 min.
+            _no_fork: Internal testing flag. Do not use in production.
 
         Returns:
             True if a task was processed, False if queue was empty.
         """
         from pq.worker import run_worker_once
 
-        return run_worker_once(self, max_runtime=max_runtime)
+        return run_worker_once(self, max_runtime=max_runtime, _no_fork=_no_fork)
