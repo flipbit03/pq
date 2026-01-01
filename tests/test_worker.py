@@ -1,5 +1,6 @@
 """Tests for worker logic."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -277,3 +278,96 @@ class TestPeriodicTasks:
 
         # Should only run ONCE (not 3+ times to catch up)
         assert len(count) == 1
+
+
+class TestAsyncTasks:
+    """Tests for async task handler support."""
+
+    def test_processes_async_one_off_task(self, pq: PQ) -> None:
+        """Worker processes an async one-off task."""
+        results: list[dict[str, Any]] = []
+
+        @pq.task("async_task")
+        async def async_handler(payload: dict[str, Any]) -> None:
+            await asyncio.sleep(0.01)  # Simulate async work
+            results.append(payload)
+
+        pq.enqueue("async_task", {"value": "async_test"})
+        processed = pq.run_worker_once()
+
+        assert processed is True
+        assert results == [{"value": "async_test"}]
+
+    def test_processes_async_periodic_task(self, pq: PQ) -> None:
+        """Worker processes an async periodic task."""
+        results: list[dict[str, Any]] = []
+
+        @pq.task("async_periodic")
+        async def async_handler(payload: dict[str, Any]) -> None:
+            await asyncio.sleep(0.01)
+            results.append(payload)
+
+        pq.schedule("async_periodic", run_every=timedelta(hours=1), payload={"n": 1})
+
+        processed = pq.run_worker_once()
+
+        assert processed is True
+        assert results == [{"n": 1}]
+
+    def test_async_task_failure_handled(self, pq: PQ) -> None:
+        """Worker handles async task failures correctly."""
+
+        @pq.task("async_failing")
+        async def async_handler(payload: dict[str, Any]) -> None:
+            await asyncio.sleep(0.01)
+            raise ValueError("async boom")
+
+        pq.enqueue("async_failing", {})
+        assert pq.pending_count() == 1
+
+        pq.run_worker_once()
+
+        # Task should be deleted even on failure
+        assert pq.pending_count() == 0
+
+
+class TestTaskTimeout:
+    """Tests for task timeout functionality."""
+
+    def test_async_task_timeout(self, pq: PQ) -> None:
+        """Async task that exceeds timeout is terminated."""
+        results: list[str] = []
+
+        @pq.task("slow_async")
+        async def slow_handler(payload: dict[str, Any]) -> None:
+            await asyncio.sleep(10)  # Would take 10 seconds
+            results.append("completed")
+
+        pq.enqueue("slow_async", {})
+        # Use 0.1 second timeout - task should timeout
+        pq.run_worker_once(max_runtime=0.1)
+
+        # Handler should not have completed
+        assert results == []
+        # Task should still be removed
+        assert pq.pending_count() == 0
+
+    def test_sync_task_timeout(self, pq: PQ) -> None:
+        """Sync task that exceeds timeout is terminated."""
+        import time
+
+        results: list[str] = []
+
+        @pq.task("slow_sync")
+        def slow_handler(payload: dict[str, Any]) -> None:
+            time.sleep(10)  # Would take 10 seconds
+            results.append("completed")
+
+        pq.enqueue("slow_sync", {})
+        # Use 1 second timeout (SIGALRM has 1-second granularity)
+        pq.run_worker_once(max_runtime=1)
+
+        # Handler should not have completed
+        assert results == []
+        # Task should still be removed
+        assert pq.pending_count() == 0

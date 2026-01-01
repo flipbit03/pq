@@ -207,22 +207,28 @@ class PQ:
             result = session.execute(select(func.count()).select_from(Periodic))
             return result.scalar_one()
 
-    def run_worker(self, *, poll_interval: float = 1.0) -> None:
+    def run_worker(
+        self, *, poll_interval: float = 1.0, max_runtime: float = 30 * 60
+    ) -> None:
         """Run the worker loop (blocking).
 
         Args:
             poll_interval: Seconds to sleep between polls when idle.
+            max_runtime: Maximum execution time per task in seconds. Default: 30 min.
         """
         from pq.worker import run_worker
 
-        run_worker(self, poll_interval=poll_interval)
+        run_worker(self, poll_interval=poll_interval, max_runtime=max_runtime)
 
-    def run_worker_once(self) -> bool:
+    def run_worker_once(self, *, max_runtime: float = 30 * 60) -> bool:
         """Process a single task if available.
+
+        Args:
+            max_runtime: Maximum execution time per task in seconds. Default: 30 min.
 
         Returns:
             True if a task was processed, False if queue was empty.
         """
         from pq.worker import run_worker_once
 
-        return run_worker_once(self)
+        return run_worker_once(self, max_runtime=max_runtime)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-PQ Example - Comprehensive showcase of all features.
+PQ Example - Comprehensive showcase of all features (sync and async).
 
 Usage:
     uv run examples/full.py full            # Run FULL showcase of all features
@@ -64,6 +64,7 @@ Priority levels (lower value = higher priority):
     pq.enqueue("task", payload, priority=Priority.BATCH)     # 20
 """
 
+import asyncio
 import sys
 from datetime import UTC, datetime, timedelta
 
@@ -124,6 +125,20 @@ def flaky_task(payload: dict) -> None:
     raise ValueError(f"Simulated error: {payload.get('reason', 'unknown')}")
 
 
+@pq.task("async_greet")
+async def async_greet(payload: dict) -> None:
+    """Async greeting task - demonstrates async handler support."""
+    await asyncio.sleep(0.1)  # Simulate async I/O
+    logger.info(f"👋 [async] Hello, {payload['name']}!")
+
+
+@pq.task("async_fetch")
+async def async_fetch(payload: dict) -> None:
+    """Simulates async data fetching."""
+    await asyncio.sleep(0.2)  # Simulate network delay
+    logger.info(f"📡 [async] Fetched data for: {payload.get('url', 'unknown')}")
+
+
 # Method 2: Explicit registration
 def send_email(payload: dict) -> None:
     """Email task registered explicitly."""
@@ -154,10 +169,10 @@ def cmd_full() -> None:
 
     # Start fresh
     pq.clear_all()
-    logger.info("[1/8] CLEARED - Starting fresh")
+    logger.info("[1/9] CLEARED - Starting fresh")
 
     # === Registration Methods ===
-    logger.info("[2/8] REGISTRATION METHODS")
+    logger.info("[2/9] REGISTRATION METHODS")
     logger.info("-" * 40)
     logger.info("✓ @pq.task('greet') - Decorator registration")
     logger.info("✓ pq.register('send_email', fn) - Explicit registration")
@@ -166,7 +181,7 @@ def cmd_full() -> None:
     logger.info("")
 
     # === One-off Tasks ===
-    logger.info("[3/8] ENQUEUEING ONE-OFF TASKS")
+    logger.info("[3/9] ENQUEUEING ONE-OFF TASKS")
     logger.info("-" * 40)
 
     # By name (decorator-registered)
@@ -192,7 +207,7 @@ def cmd_full() -> None:
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Delayed Task ===
-    logger.info("[4/8] DELAYED TASK (run_at)")
+    logger.info("[4/9] DELAYED TASK (run_at)")
     logger.info("-" * 40)
     run_at = datetime.now(UTC) + timedelta(seconds=3)
     id6 = pq.enqueue("greet", {"name": "Future"}, run_at=run_at)
@@ -200,7 +215,7 @@ def cmd_full() -> None:
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Cancellation ===
-    logger.info("[5/8] TASK CANCELLATION")
+    logger.info("[5/9] TASK CANCELLATION")
     logger.info("-" * 40)
     cancel_id = pq.enqueue("greet", {"name": "WillBeCancelled"})
     logger.info(f"Enqueued task -> id={cancel_id}")
@@ -210,15 +225,27 @@ def cmd_full() -> None:
     logger.info(f"Pending after cancel: {pq.pending_count()}\n")
 
     # === Error Handling ===
-    logger.info("[6/8] ERROR HANDLING")
+    logger.info("[6/9] ERROR HANDLING")
     logger.info("-" * 40)
     pq.enqueue("flaky", {"reason": "demo failure"})
     logger.info("Enqueued flaky task (will fail)")
     pq.run_worker_once()  # This will log the error but continue
     logger.info("Worker continued after error (task removed)\n")
 
+    # === Async Tasks ===
+    logger.info("[7/9] ASYNC TASKS")
+    logger.info("-" * 40)
+    id_async1 = pq.enqueue("async_greet", {"name": "Async World"})
+    logger.info(f"Enqueued 'async_greet' -> id={id_async1}")
+    id_async2 = pq.enqueue("async_fetch", {"url": "https://api.example.com"})
+    logger.info(f"Enqueued 'async_fetch' -> id={id_async2}")
+    logger.info("Processing async tasks...")
+    pq.run_worker_once()
+    pq.run_worker_once()
+    logger.info("Async tasks completed\n")
+
     # === Periodic Tasks ===
-    logger.info("[7/8] PERIODIC TASKS")
+    logger.info("[8/9] PERIODIC TASKS")
     logger.info("-" * 40)
     pq.schedule("tick", run_every=timedelta(seconds=2))
     logger.info("Scheduled 'tick' every 2 seconds")
@@ -227,7 +254,7 @@ def cmd_full() -> None:
     logger.info(f"Periodic count: {pq.periodic_count()}\n")
 
     # === Process Everything ===
-    logger.info("[8/8] PROCESSING")
+    logger.info("[9/9] PROCESSING")
     logger.info("-" * 40)
     logger.info("Processing one-off tasks...")
 
