@@ -126,7 +126,7 @@ def cmd_full() -> None:
 
     # Start fresh
     pq.clear_all()
-    logger.info("\n[1/7] CLEARED - Starting fresh\n")
+    logger.info("[1/7] CLEARED - Starting fresh")
 
     # === Registration Methods ===
     logger.info("[2/7] REGISTRATION METHODS")
@@ -188,41 +188,41 @@ def cmd_full() -> None:
     # === Process Everything ===
     logger.info("[7/7] PROCESSING")
     logger.info("-" * 40)
-    logger.info("Processing one-off tasks...\n")
+    logger.info("Processing one-off tasks...")
 
     # Process immediate one-off tasks
     while pq.run_worker_once():
         pass
 
     # Wait for delayed task
-    logger.info("\nWaiting for delayed task...")
+    logger.info("Waiting for delayed task...")
     time.sleep(3.5)
     pq.run_worker_once()
 
     # Process a few periodic ticks
-    logger.info("\nProcessing periodic tasks (5 seconds)...")
+    logger.info("Processing periodic tasks (5 seconds)...")
     end_time = time.time() + 5
     while time.time() < end_time:
         pq.run_worker_once()
         time.sleep(0.5)
 
     # Unschedule periodic
-    logger.info("\nUnscheduling periodic tasks...")
+    logger.info("Unscheduling periodic tasks...")
     pq.unschedule("tick")
     pq.unschedule("report")
 
     # Final status
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("FINAL STATUS")
     logger.info("=" * 60)
     logger.info(f"Pending one-off: {pq.pending_count()}")
     logger.info(f"Periodic schedules: {pq.periodic_count()}")
-    logger.info("\n✅ Full showcase complete!")
+    logger.info("✅ Full showcase complete!")
 
 
 def cmd_demo() -> None:
     """Run a full demo: enqueue tasks and process them."""
-    logger.info("=== PQ Demo ===\n")
+    logger.info("=== PQ Demo ===")
 
     # Clear any existing tasks
     pq.clear_all()
@@ -240,19 +240,19 @@ def cmd_demo() -> None:
     # Direct function reference (no prior registration)
     pq.enqueue(standalone_task, {"data": "test"})
 
-    logger.info(f"Queued {pq.pending_count()} tasks\n")
+    logger.info(f"Queued {pq.pending_count()} tasks")
 
     # Process all tasks
     logger.info("Processing tasks...")
     while pq.run_worker_once():
         pass
 
-    logger.info("\n✅ Demo complete!")
+    logger.info("✅ Demo complete!")
 
 
 def cmd_enqueue() -> None:
     """Enqueue one-off tasks using various methods."""
-    logger.info("=== Enqueueing One-Off Tasks ===\n")
+    logger.info("=== Enqueueing One-Off Tasks ===")
 
     # Method 1: By registered name
     task_id = pq.enqueue("greet", {"name": "Alice"})
@@ -266,12 +266,12 @@ def cmd_enqueue() -> None:
     task_id = pq.enqueue(standalone_task, {"key": "value"})
     logger.info(f"Enqueued standalone_task directly -> ID: {task_id[:8]}...")
 
-    logger.info(f"\nTotal pending: {pq.pending_count()}")
+    logger.info(f"Total pending: {pq.pending_count()}")
 
 
 def cmd_delayed() -> None:
     """Enqueue a task scheduled for the future."""
-    logger.info("=== Scheduling Delayed Task ===\n")
+    logger.info("=== Scheduling Delayed Task ===")
 
     # Schedule task for 10 seconds from now
     run_at = datetime.now(UTC) + timedelta(seconds=10)
@@ -283,7 +283,7 @@ def cmd_delayed() -> None:
 
 def cmd_schedule() -> None:
     """Schedule periodic tasks."""
-    logger.info("=== Scheduling Periodic Tasks ===\n")
+    logger.info("=== Scheduling Periodic Tasks ===")
 
     # Simple periodic task
     pq.schedule("tick", run_every=timedelta(seconds=5))
@@ -293,13 +293,13 @@ def cmd_schedule() -> None:
     pq.schedule("report", run_every=timedelta(seconds=10), payload={"type": "hourly"})
     logger.info("Scheduled 'report' every 10 seconds with payload")
 
-    logger.info(f"\nTotal periodic schedules: {pq.periodic_count()}")
+    logger.info(f"Total periodic schedules: {pq.periodic_count()}")
     logger.info("Run 'work' command to start processing")
 
 
 def cmd_cancel() -> None:
     """Demo cancelling a task before it runs."""
-    logger.info("=== Cancel Demo ===\n")
+    logger.info("=== Cancel Demo ===")
 
     # Enqueue a task
     task_id = pq.enqueue("greet", {"name": "NeverRuns"})
@@ -314,7 +314,7 @@ def cmd_cancel() -> None:
 
 def cmd_unschedule() -> None:
     """Demo removing a periodic task."""
-    logger.info("=== Unschedule Demo ===\n")
+    logger.info("=== Unschedule Demo ===")
 
     # Schedule a task
     pq.schedule("tick", run_every=timedelta(seconds=5))
@@ -330,7 +330,7 @@ def cmd_work() -> None:
     """Run the worker loop."""
     logger.info("=== Starting Worker ===")
     logger.info(f"Pending: {pq.pending_count()}, Periodic: {pq.periodic_count()}")
-    logger.info("Press Ctrl+C to stop\n")
+    logger.info("Press Ctrl+C to stop")
     pq.run_worker(poll_interval=1.0)
 
 
