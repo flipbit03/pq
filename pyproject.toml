@@ -33,3 +33,11 @@ dev = [
     "ruff>=0.14.10",
     "ty>=0.0.8",
 ]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # Suppress fork+threads warning in tests. This occurs because multiprocessing.Manager
+    # creates background threads for proxy objects, and our worker uses os.fork().
+    # In production, workers run in separate processes (not threads), so this is safe.
+    "ignore:This process .* is multi-threaded, use of fork\\(\\) may lead to deadlocks in the child:DeprecationWarning",
+]
