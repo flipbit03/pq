@@ -2,8 +2,6 @@
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
-
 
 from pq.client import PQ
 from pq.models import Periodic, Task
@@ -60,11 +58,11 @@ class TestEnqueue:
             task = session.execute(select(Task).where(Task.id == task_id)).scalar_one()
             assert task.name == "tests.test_client:dummy_handler"
 
-    def test_enqueue_returns_valid_uuid(self, pq: PQ) -> None:
-        """Enqueue returns a valid UUID string."""
+    def test_enqueue_returns_int_id(self, pq: PQ) -> None:
+        """Enqueue returns an integer ID."""
         task_id = pq.enqueue("my_task", {})
-        # Should not raise
-        UUID(task_id)
+        assert isinstance(task_id, int)
+        assert task_id > 0
 
 
 class TestSchedule:
@@ -127,14 +125,8 @@ class TestCancel:
 
     def test_cancel_nonexistent_returns_false(self, pq: PQ) -> None:
         """Cancel returns False for nonexistent task."""
-        result = pq.cancel("00000000-0000-0000-0000-000000000000")
+        result = pq.cancel(999999)
         assert result is False
-
-    def test_cancel_accepts_uuid_object(self, pq: PQ) -> None:
-        """Cancel accepts UUID object."""
-        task_id = pq.enqueue("my_task", {})
-        result = pq.cancel(UUID(task_id))
-        assert result is True
 
 
 class TestUnschedule:

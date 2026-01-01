@@ -2,10 +2,9 @@
 
 from datetime import datetime, timedelta
 from typing import Any
-from uuid import uuid4
 
-from sqlalchemy import DateTime, Interval, String, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import BigInteger, DateTime, Identity, Interval, String, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -20,9 +19,7 @@ class Task(Base):
 
     __tablename__ = "pq_tasks"
 
-    id: Mapped[str] = mapped_column(
-        UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid4())
-    )
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     run_at: Mapped[datetime] = mapped_column(
@@ -38,9 +35,7 @@ class Periodic(Base):
 
     __tablename__ = "pq_periodic"
 
-    id: Mapped[str] = mapped_column(
-        UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid4())
-    )
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     run_every: Mapped[timedelta] = mapped_column(Interval, nullable=False)

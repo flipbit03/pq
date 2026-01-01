@@ -154,23 +154,23 @@ def cmd_full() -> None:
 
     # By name (decorator-registered)
     id1 = pq.enqueue("greet", {"name": "World"})
-    logger.info(f"Enqueued 'greet' by name -> {id1[:8]}...")
+    logger.info(f"Enqueued 'greet' by name -> id={id1}")
 
     # By name (explicitly registered)
     id2 = pq.enqueue("send_email", {"to": "alice@test.com", "subject": "Hello!"})
-    logger.info(f"Enqueued 'send_email' by name -> {id2[:8]}...")
+    logger.info(f"Enqueued 'send_email' by name -> id={id2}")
 
     # Direct function reference (same module)
     id3 = pq.enqueue(standalone_task, {"data": "direct_call"})
-    logger.info(f"Enqueued standalone_task directly -> {id3[:8]}...")
+    logger.info(f"Enqueued standalone_task directly -> id={id3}")
 
     # Imported function reference (cross-module)
     id4 = pq.enqueue(external_task, {"source": "imported"})
-    logger.info(f"Enqueued external_task (imported) -> {id4[:8]}...")
+    logger.info(f"Enqueued external_task (imported) -> id={id4}")
 
     # Math task
     id5 = pq.enqueue("add", {"a": 100, "b": 200})
-    logger.info(f"Enqueued 'add' by name -> {id5[:8]}...")
+    logger.info(f"Enqueued 'add' by name -> id={id5}")
 
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
@@ -179,17 +179,17 @@ def cmd_full() -> None:
     logger.info("-" * 40)
     run_at = datetime.now(UTC) + timedelta(seconds=3)
     id6 = pq.enqueue("greet", {"name": "Future"}, run_at=run_at)
-    logger.info(f"Scheduled for {run_at.strftime('%H:%M:%S')} -> {id6[:8]}...")
+    logger.info(f"Scheduled for {run_at.strftime('%H:%M:%S')} -> id={id6}")
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Cancellation ===
     logger.info("[5/7] TASK CANCELLATION")
     logger.info("-" * 40)
     cancel_id = pq.enqueue("greet", {"name": "WillBeCancelled"})
-    logger.info(f"Enqueued task -> {cancel_id[:8]}...")
+    logger.info(f"Enqueued task -> id={cancel_id}")
     logger.info(f"Pending before cancel: {pq.pending_count()}")
     pq.cancel(cancel_id)
-    logger.info(f"Cancelled task -> {cancel_id[:8]}...")
+    logger.info(f"Cancelled task -> id={cancel_id}")
     logger.info(f"Pending after cancel: {pq.pending_count()}\n")
 
     # === Periodic Tasks ===
@@ -272,15 +272,15 @@ def cmd_enqueue() -> None:
 
     # Method 1: By registered name
     task_id = pq.enqueue("greet", {"name": "Alice"})
-    logger.info(f"Enqueued 'greet' by name -> ID: {task_id[:8]}...")
+    logger.info(f"Enqueued 'greet' by name -> id={task_id}")
 
     # Method 2: By explicitly registered name
     task_id = pq.enqueue("send_email", {"to": "bob@test.com", "subject": "Hi"})
-    logger.info(f"Enqueued 'send_email' by name -> ID: {task_id[:8]}...")
+    logger.info(f"Enqueued 'send_email' by name -> id={task_id}")
 
     # Method 3: Direct function reference
     task_id = pq.enqueue(standalone_task, {"key": "value"})
-    logger.info(f"Enqueued standalone_task directly -> ID: {task_id[:8]}...")
+    logger.info(f"Enqueued standalone_task directly -> id={task_id}")
 
     logger.info(f"Total pending: {pq.pending_count()}")
 
@@ -293,7 +293,7 @@ def cmd_delayed() -> None:
     run_at = datetime.now(UTC) + timedelta(seconds=10)
     task_id = pq.enqueue("greet", {"name": "Future"}, run_at=run_at)
 
-    logger.info(f"Scheduled task for {run_at.strftime('%H:%M:%S')} -> ID: {task_id[:8]}...")
+    logger.info(f"Scheduled task for {run_at.strftime('%H:%M:%S')} -> id={task_id}")
     logger.info("Run 'work' command to process when ready")
 
 
@@ -319,7 +319,7 @@ def cmd_cancel() -> None:
 
     # Enqueue a task
     task_id = pq.enqueue("greet", {"name": "NeverRuns"})
-    logger.info(f"Enqueued task -> ID: {task_id[:8]}...")
+    logger.info(f"Enqueued task -> id={task_id}")
     logger.info(f"Pending count: {pq.pending_count()}")
 
     # Cancel it

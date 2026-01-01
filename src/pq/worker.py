@@ -63,10 +63,11 @@ def _process_one_off_task(pq: PQ) -> bool:
     """
     session = pq._session_factory()
     try:
-        # Claim task with FOR UPDATE SKIP LOCKED
+        # Claim oldest due task with FOR UPDATE SKIP LOCKED
         stmt = (
             select(Task)
             .where(Task.run_at <= func.now())
+            .order_by(Task.run_at)
             .with_for_update(skip_locked=True)
             .limit(1)
         )
@@ -114,10 +115,11 @@ def _process_periodic_task(pq: PQ) -> bool:
     payload = None
 
     try:
-        # Claim periodic task with FOR UPDATE SKIP LOCKED
+        # Claim oldest due periodic task with FOR UPDATE SKIP LOCKED
         stmt = (
             select(Periodic)
             .where(Periodic.next_run <= func.now())
+            .order_by(Periodic.next_run)
             .with_for_update(skip_locked=True)
             .limit(1)
         )

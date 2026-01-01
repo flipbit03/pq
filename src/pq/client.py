@@ -4,7 +4,6 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
 
 from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
@@ -86,7 +85,7 @@ class PQ:
         payload: dict[str, Any] | None = None,
         *,
         run_at: datetime | None = None,
-    ) -> str:
+    ) -> int:
         """Enqueue a one-off task.
 
         Args:
@@ -95,7 +94,7 @@ class PQ:
             run_at: When to run the task. Defaults to now.
 
         Returns:
-            Task ID (UUID string).
+            Task ID.
         """
         if callable(task):
             name = get_function_path(task)
@@ -121,7 +120,7 @@ class PQ:
         *,
         run_every: timedelta,
         payload: dict[str, Any] | None = None,
-    ) -> str:
+    ) -> int:
         """Schedule a periodic task.
 
         If a periodic task with this name already exists, it will be updated.
@@ -132,7 +131,7 @@ class PQ:
             payload: Data to pass to the task handler.
 
         Returns:
-            Periodic task ID (UUID string).
+            Periodic task ID.
         """
         if payload is None:
             payload = {}
@@ -161,19 +160,17 @@ class PQ:
             result = session.execute(stmt)
             return result.scalar_one()
 
-    def cancel(self, task_id: str | UUID) -> bool:
+    def cancel(self, task_id: int) -> bool:
         """Cancel a one-off task by ID.
 
         Args:
-            task_id: Task UUID.
+            task_id: Task ID.
 
         Returns:
             True if task was found and deleted, False otherwise.
         """
-        task_id_str = str(task_id)
-
         with self.session() as session:
-            stmt = delete(Task).where(Task.id == task_id_str)
+            stmt = delete(Task).where(Task.id == task_id)
             result = session.execute(stmt)
             return result.rowcount > 0
 
