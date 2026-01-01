@@ -227,3 +227,32 @@ class TestPeriodicTasks:
                 select(Periodic).where(Periodic.name == "failing")
             ).scalar_one()
             assert periodic.next_run > original_next_run
+
+    def test_overdue_periodic_runs_once(self, pq: PQ) -> None:
+        """Overdue periodic task runs once, not historically."""
+        from sqlalchemy import update
+
+        count: list[int] = []
+
+        @pq.task("overdue")
+        def handler(payload: dict[str, Any]) -> None:
+            count.append(1)
+
+        # Schedule with 1 hour interval
+        pq.schedule("overdue", run_every=timedelta(hours=1))
+
+        # Manually set next_run to 3 hours ago (simulating missed runs)
+        with pq.session() as session:
+            session.execute(
+                update(Periodic)
+                .where(Periodic.name == "overdue")
+                .values(next_run=datetime.now(UTC) - timedelta(hours=3))
+            )
+
+        # Run worker multiple times
+        pq.run_worker_once()
+        pq.run_worker_once()
+        pq.run_worker_once()
+
+        # Should only run ONCE (not 3+ times to catch up)
+        assert len(count) == 1

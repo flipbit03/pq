@@ -130,9 +130,9 @@ def _process_periodic_task(pq: PQ) -> bool:
         name = periodic.name
         payload = periodic.payload
 
-        # Advance schedule BEFORE execution
+        # Advance schedule BEFORE execution (base on now, not old next_run)
         periodic.last_run = func.now()
-        periodic.next_run = periodic.next_run + periodic.run_every
+        periodic.next_run = func.now() + periodic.run_every
         session.commit()
 
     except Exception as e:
