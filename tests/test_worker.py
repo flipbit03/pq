@@ -91,6 +91,26 @@ class TestRunWorkerOnce:
 
         assert tracked_handler_calls == [{"key": "value"}]
 
+    def test_processes_higher_priority_first(self, pq: PQ) -> None:
+        """Worker processes higher priority tasks first."""
+        results: list[int] = []
+
+        @pq.task("ordered")
+        def handler(payload: dict[str, Any]) -> None:
+            results.append(payload["n"])
+
+        # Enqueue in reverse priority order
+        pq.enqueue("ordered", {"n": 3}, priority=10)  # Low priority
+        pq.enqueue("ordered", {"n": 1}, priority=-10)  # High priority
+        pq.enqueue("ordered", {"n": 2}, priority=0)  # Normal priority
+
+        pq.run_worker_once()
+        pq.run_worker_once()
+        pq.run_worker_once()
+
+        # Should process in priority order: high (-10), normal (0), low (10)
+        assert results == [1, 2, 3]
+
 
 class TestPeriodicTasks:
     """Tests for periodic task processing."""

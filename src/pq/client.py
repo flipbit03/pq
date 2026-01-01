@@ -85,6 +85,7 @@ class PQ:
         payload: dict[str, Any] | None = None,
         *,
         run_at: datetime | None = None,
+        priority: int = 0,
     ) -> int:
         """Enqueue a one-off task.
 
@@ -92,6 +93,7 @@ class PQ:
             task: Task name (string) or callable function.
             payload: Data to pass to the task handler.
             run_at: When to run the task. Defaults to now.
+            priority: Task priority. Lower = higher priority. Defaults to 0.
 
         Returns:
             Task ID.
@@ -107,7 +109,7 @@ class PQ:
         if run_at is None:
             run_at = datetime.now(UTC)
 
-        task_obj = Task(name=name, payload=payload, run_at=run_at)
+        task_obj = Task(name=name, payload=payload, run_at=run_at, priority=priority)
 
         with self.session() as session:
             session.add(task_obj)
@@ -120,6 +122,7 @@ class PQ:
         *,
         run_every: timedelta,
         payload: dict[str, Any] | None = None,
+        priority: int = 0,
     ) -> int:
         """Schedule a periodic task.
 
@@ -129,6 +132,7 @@ class PQ:
             name: Task name.
             run_every: Interval between executions.
             payload: Data to pass to the task handler.
+            priority: Task priority. Lower = higher priority. Defaults to 0.
 
         Returns:
             Periodic task ID.
@@ -144,6 +148,7 @@ class PQ:
                 .values(
                     name=name,
                     payload=payload,
+                    priority=priority,
                     run_every=run_every,
                     next_run=next_run,
                 )
@@ -151,6 +156,7 @@ class PQ:
                     index_elements=["name"],
                     set_={
                         "payload": payload,
+                        "priority": priority,
                         "run_every": run_every,
                         "next_run": next_run,
                     },

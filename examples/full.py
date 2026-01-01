@@ -52,6 +52,16 @@ Usage:
 
 3. Remove schedule:
     pq.unschedule("task_name")
+
+=== PRIORITY ===
+
+1. Using Priority enum:
+    from pq import Priority
+    pq.enqueue("task", payload, priority=Priority.HIGH)
+
+2. Using raw integers (lower = higher priority):
+    pq.enqueue("urgent", payload, priority=-10)  # Runs before priority=0
+    pq.enqueue("batch", payload, priority=10)    # Runs after priority=0
 """
 
 import sys
@@ -66,7 +76,7 @@ from pq import PQ
 try:
     from examples.tasks import external_task
 except ModuleNotFoundError:
-    from tasks import external_task
+    from tasks import external_task  # type: ignore[import-not-found]
 
 # =============================================================================
 # SETUP
