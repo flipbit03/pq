@@ -27,6 +27,10 @@ Usage:
 3. Direct function (no registration needed):
     pq.enqueue(my_handler, payload)  # Uses module:function path
 
+4. Imported function (cross-module):
+    from examples.tasks import external_task
+    pq.enqueue(external_task, payload)  # Stores "examples.tasks:external_task"
+
 === ENQUEUEING METHODS ===
 
 1. By registered name:
@@ -56,6 +60,13 @@ from datetime import UTC, datetime, timedelta
 from loguru import logger
 
 from pq import PQ
+
+# Import from sibling module - demonstrates cross-module function reference
+# When run as script, we need to handle the import specially
+try:
+    from examples.tasks import external_task
+except ModuleNotFoundError:
+    from tasks import external_task
 
 # =============================================================================
 # SETUP
@@ -133,7 +144,8 @@ def cmd_full() -> None:
     logger.info("-" * 40)
     logger.info("✓ @pq.task('greet') - Decorator registration")
     logger.info("✓ pq.register('send_email', fn) - Explicit registration")
-    logger.info("✓ standalone_task - No registration (uses import path)")
+    logger.info("✓ standalone_task - Direct function (same module)")
+    logger.info("✓ external_task - Imported function (cross-module)")
     logger.info("")
 
     # === One-off Tasks ===
@@ -148,13 +160,17 @@ def cmd_full() -> None:
     id2 = pq.enqueue("send_email", {"to": "alice@test.com", "subject": "Hello!"})
     logger.info(f"Enqueued 'send_email' by name -> {id2[:8]}...")
 
-    # Direct function reference
+    # Direct function reference (same module)
     id3 = pq.enqueue(standalone_task, {"data": "direct_call"})
     logger.info(f"Enqueued standalone_task directly -> {id3[:8]}...")
 
+    # Imported function reference (cross-module)
+    id4 = pq.enqueue(external_task, {"source": "imported"})
+    logger.info(f"Enqueued external_task (imported) -> {id4[:8]}...")
+
     # Math task
-    id4 = pq.enqueue("add", {"a": 100, "b": 200})
-    logger.info(f"Enqueued 'add' by name -> {id4[:8]}...")
+    id5 = pq.enqueue("add", {"a": 100, "b": 200})
+    logger.info(f"Enqueued 'add' by name -> {id5[:8]}...")
 
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
@@ -162,8 +178,8 @@ def cmd_full() -> None:
     logger.info("[4/7] DELAYED TASK (run_at)")
     logger.info("-" * 40)
     run_at = datetime.now(UTC) + timedelta(seconds=3)
-    id5 = pq.enqueue("greet", {"name": "Future"}, run_at=run_at)
-    logger.info(f"Scheduled for {run_at.strftime('%H:%M:%S')} -> {id5[:8]}...")
+    id6 = pq.enqueue("greet", {"name": "Future"}, run_at=run_at)
+    logger.info(f"Scheduled for {run_at.strftime('%H:%M:%S')} -> {id6[:8]}...")
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Cancellation ===
