@@ -1,5 +1,7 @@
 """Tests for PQ client."""
 
+import pytest
+from croniter import croniter
 from datetime import UTC, datetime, timedelta
 
 from pq.client import PQ
@@ -13,6 +15,11 @@ def dummy_handler(key: str = "") -> None:
 
 def cleanup_handler(full: bool = False) -> None:
     """Cleanup handler for testing periodic tasks."""
+    pass
+
+
+def cron_handler() -> None:
+    """Handler for cron tests."""
     pass
 
 
@@ -114,6 +121,46 @@ class TestSchedule:
             ).scalar_one()
             assert periodic.run_every == timedelta(hours=2)
             assert periodic.payload["kwargs"] == {"full": True}
+
+    def test_schedule_with_cron_string(self, pq: PQ) -> None:
+        """Schedule with valid cron string works."""
+        pq.schedule(cron_handler, cron="0 9 * * 1")  # Monday 9am
+
+        with pq.session() as session:
+            from sqlalchemy import select
+
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cron_handler"
+                )
+            ).scalar_one()
+            assert periodic.cron == "0 9 * * 1"
+            assert periodic.run_every is None
+
+    def test_schedule_with_invalid_cron_raises(self, pq: PQ) -> None:
+        """Schedule with invalid cron string raises ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            pq.schedule(cron_handler, cron="invalid cron")
+
+        assert "Invalid cron expression" in str(exc_info.value)
+        assert "invalid cron" in str(exc_info.value)
+
+    def test_schedule_with_croniter_object(self, pq: PQ) -> None:
+        """Schedule with croniter object works."""
+        cron_obj = croniter("30 14 * * 5")  # Friday 2:30pm
+        pq.schedule(cron_handler, cron=cron_obj)
+
+        with pq.session() as session:
+            from sqlalchemy import select
+
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cron_handler"
+                )
+            ).scalar_one()
+            # Expression should be extracted and stored
+            assert periodic.cron == "30 14 * * 5"
+            assert periodic.run_every is None
 
 
 class TestCancel:

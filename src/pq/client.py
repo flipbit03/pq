@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from croniter import croniter
+from croniter.croniter import CroniterBadCronError
 from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
@@ -97,7 +98,7 @@ class PQ:
         task: Callable[..., Any],
         *args: Any,
         run_every: timedelta | None = None,
-        cron: str | None = None,
+        cron: str | croniter | None = None,
         priority: Priority = Priority.NORMAL,
         **kwargs: Any,
     ) -> int:
@@ -110,7 +111,7 @@ class PQ:
             task: Callable function to execute.
             *args: Positional arguments to pass to the handler.
             run_every: Interval between executions (e.g., timedelta(hours=1)).
-            cron: Cron expression (e.g., "0 9 * * 1" for Monday 9am).
+            cron: Cron expression string (e.g., "0 9 * * 1") or croniter object.
             priority: Task priority. Higher = higher priority. Defaults to NORMAL.
             **kwargs: Keyword arguments to pass to the handler.
 
@@ -119,6 +120,7 @@ class PQ:
 
         Raises:
             ValueError: If neither run_every nor cron is provided, or if both are.
+            ValueError: If cron expression is invalid.
             ValueError: If task is a lambda, closure, or cannot be imported.
         """
         if run_every is None and cron is None:
@@ -126,13 +128,27 @@ class PQ:
         if run_every is not None and cron is not None:
             raise ValueError("Only one of run_every or cron can be provided")
 
+        # Validate and normalize cron expression
+        cron_expr: str | None = None
+        if cron is not None:
+            if isinstance(cron, croniter):
+                # Extract expression from croniter object
+                cron_expr = " ".join(str(f) for f in cron.expressions)
+            else:
+                # Validate string expression
+                try:
+                    croniter(cron)
+                except (KeyError, ValueError, CroniterBadCronError) as e:
+                    raise ValueError(f"Invalid cron expression '{cron}': {e}") from e
+                cron_expr = cron
+
         name = get_function_path(task)
         payload = serialize(args, kwargs)
 
         # Calculate next_run based on cron or interval
         now = datetime.now(UTC)
-        if cron:
-            cron_iter = croniter(cron, now)
+        if cron_expr:
+            cron_iter = croniter(cron_expr, now)
             next_run = cron_iter.get_next(datetime)
         else:
             next_run = now
@@ -145,7 +161,7 @@ class PQ:
                     payload=payload,
                     priority=priority,
                     run_every=run_every,
-                    cron=cron,
+                    cron=cron_expr,
                     next_run=next_run,
                 )
                 .on_conflict_do_update(
@@ -154,7 +170,7 @@ class PQ:
                         "payload": payload,
                         "priority": priority,
                         "run_every": run_every,
-                        "cron": cron,
+                        "cron": cron_expr,
                         "next_run": next_run,
                     },
                 )
