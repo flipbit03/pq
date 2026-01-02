@@ -234,7 +234,10 @@ class PQ:
             Task object or None if not found.
         """
         with self.session() as session:
-            return session.get(Task, task_id)
+            task = session.get(Task, task_id)
+            if task:
+                session.expunge(task)
+            return task
 
     def list_failed(self, limit: int = 100) -> list[Task]:
         """List failed tasks.
@@ -252,7 +255,10 @@ class PQ:
                 .order_by(Task.completed_at.desc())
                 .limit(limit)
             )
-            return list(session.execute(stmt).scalars().all())
+            tasks = list(session.execute(stmt).scalars().all())
+            for task in tasks:
+                session.expunge(task)
+            return tasks
 
     def list_completed(self, limit: int = 100) -> list[Task]:
         """List completed tasks.
@@ -270,7 +276,10 @@ class PQ:
                 .order_by(Task.completed_at.desc())
                 .limit(limit)
             )
-            return list(session.execute(stmt).scalars().all())
+            tasks = list(session.execute(stmt).scalars().all())
+            for task in tasks:
+                session.expunge(task)
+            return tasks
 
     def clear_completed(self, before: datetime | None = None) -> int:
         """Clear completed tasks.
