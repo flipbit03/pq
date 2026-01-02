@@ -47,12 +47,13 @@ def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <version> [--push]", file=sys.stderr)
+        print(f"Usage: {sys.argv[0]} <version> [--push] [--force]", file=sys.stderr)
         print(f"Example: {sys.argv[0]} 1.0.0", file=sys.stderr)
         return 1
 
     new_version = sys.argv[1]
     push = "--push" in sys.argv
+    force = "--force" in sys.argv
 
     # Validate new version
     try:
@@ -69,8 +70,8 @@ def main() -> int:
         print(f"Error reading current version: {e}", file=sys.stderr)
         return 1
 
-    # Ensure new version is higher
-    if new_tuple <= current_tuple:
+    # Ensure new version is higher (unless --force)
+    if new_tuple <= current_tuple and not force:
         print(
             f"Error: New version {new_version} must be higher than current {current_version}",
             file=sys.stderr,
@@ -86,14 +87,20 @@ def main() -> int:
     run(["git", "commit", "-m", f"Release {new_version}"])
     print(f"Committed: Release {new_version}")
 
-    # Tag
-    run(["git", "tag", new_version])
+    # Tag (force if requested)
+    tag_cmd = (
+        ["git", "tag", "-f", new_version] if force else ["git", "tag", new_version]
+    )
+    run(tag_cmd)
     print(f"Tagged: {new_version}")
 
     # Push if requested
     if push:
         run(["git", "push"])
-        run(["git", "push", "--tags"])
+        push_tags_cmd = (
+            ["git", "push", "--tags", "--force"] if force else ["git", "push", "--tags"]
+        )
+        run(push_tags_cmd)
         print("Pushed to remote")
 
     return 0
