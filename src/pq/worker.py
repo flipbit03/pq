@@ -13,7 +13,7 @@ import signal
 import sys
 import time
 import traceback
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from croniter import croniter
@@ -32,6 +32,12 @@ if TYPE_CHECKING:
 
 # Default max runtime: 30 minutes
 DEFAULT_MAX_RUNTIME: float = 30 * 60
+
+# Default retention: 7 days
+DEFAULT_RETENTION_DAYS: int = 7
+
+# Default cleanup interval: 1 hour
+DEFAULT_CLEANUP_INTERVAL: float = 3600
 
 # Exit codes for child process
 EXIT_SUCCESS = 0
@@ -194,12 +200,45 @@ def _execute_in_fork(
                     raise Exception(f"Task failed with exit code {exit_code}")
 
 
+def _maybe_run_cleanup(
+    pq: PQ,
+    retention_days: int,
+    cleanup_interval: float,
+    last_cleanup: list[float],
+) -> None:
+    """Run cleanup if retention is enabled and interval has passed.
+
+    Args:
+        pq: PQ client instance.
+        retention_days: Days to keep completed/failed tasks. 0 to disable.
+        cleanup_interval: Seconds between cleanup runs.
+        last_cleanup: Mutable list containing last cleanup timestamp.
+    """
+    if retention_days <= 0:
+        return
+
+    now = time.time()
+    if now - last_cleanup[0] < cleanup_interval:
+        return
+
+    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+    completed = pq.clear_completed(before=cutoff)
+    failed = pq.clear_failed(before=cutoff)
+
+    if completed or failed:
+        logger.info(f"Cleanup: removed {completed} completed, {failed} failed tasks")
+
+    last_cleanup[0] = now
+
+
 def run_worker(
     pq: PQ,
     *,
     poll_interval: float = 1.0,
     max_runtime: float = DEFAULT_MAX_RUNTIME,
     priorities: Set[Priority] | None = None,
+    retention_days: int = DEFAULT_RETENTION_DAYS,
+    cleanup_interval: float = DEFAULT_CLEANUP_INTERVAL,
 ) -> None:
     """Run the worker loop indefinitely.
 
@@ -211,15 +250,22 @@ def run_worker(
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
         priorities: If set, only process tasks with these priority levels.
             Use this to dedicate workers to specific priority tiers.
+        retention_days: Days to keep completed/failed tasks. Default: 7.
+            Set to 0 to disable automatic cleanup.
+        cleanup_interval: Seconds between cleanup runs. Default: 3600 (1 hour).
     """
     if priorities:
         priority_names = ", ".join(p.name for p in sorted(priorities, reverse=True))
         logger.info(f"Starting PQ worker (priorities: {priority_names})...")
     else:
         logger.info("Starting PQ worker (fork isolation enabled)...")
+
+    last_cleanup: list[float] = [0.0]  # Mutable container for tracking
+
     try:
         while True:
             if not run_worker_once(pq, max_runtime=max_runtime, priorities=priorities):
+                _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Worker stopped.")
