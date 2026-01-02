@@ -2,6 +2,8 @@
 
 Postgres-backed job queue for Python with fork-based worker isolation.
 
+**[Documentation](https://ricwo.github.io/pq/)**
+
 ## Features
 
 - **Fork isolation** - Each task runs in a forked process. OOM or crashes don't affect the worker.
