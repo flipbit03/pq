@@ -1,5 +1,5 @@
 [project]
-name = "pq"
+name = "python-pq"
 version = "0.1.0"
 description = "Postgres-backed job queue for Python"
 readme = "README.md"
@@ -25,6 +25,9 @@ pq = "pq.cli:main"
 [build-system]
 requires = ["uv_build>=0.8.12,<0.9.0"]
 build-backend = "uv_build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pq"]
 
 [dependency-groups]
 dev = [
