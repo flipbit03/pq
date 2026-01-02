@@ -42,5 +42,6 @@ extra_css:
 nav:
   - Home: index.md
   - Examples: examples.md
+  - Database: database.md
   - Architecture: architecture.md
   - API Reference: api.md
