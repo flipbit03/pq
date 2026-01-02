@@ -11,27 +11,30 @@ def dummy_handler(key: str = "") -> None:
     pass
 
 
+def cleanup_handler(full: bool = False) -> None:
+    """Cleanup handler for testing periodic tasks."""
+    pass
+
+
 class TestEnqueue:
     """Tests for enqueue method."""
 
     def test_enqueue_creates_task(self, pq: PQ) -> None:
         """Enqueue creates a task in the database."""
-        pq.register("my_task", dummy_handler)
-        task_id = pq.enqueue("my_task", key="value")
+        task_id = pq.enqueue(dummy_handler, key="value")
 
         assert task_id is not None
         assert pq.pending_count() == 1
 
     def test_enqueue_stores_correct_data(self, pq: PQ) -> None:
         """Enqueue stores name, payload, and run_at correctly."""
-        pq.register("my_task", dummy_handler)
-        task_id = pq.enqueue("my_task", key="value")
+        task_id = pq.enqueue(dummy_handler, key="value")
 
         with pq.session() as session:
             from sqlalchemy import select
 
             task = session.execute(select(Task).where(Task.id == task_id)).scalar_one()
-            assert task.name == "my_task"
+            assert task.name == "tests.test_client:dummy_handler"
             assert task.payload["args"] == []
             assert task.payload["kwargs"] == {"key": "value"}
             assert task.run_at <= datetime.now(UTC)
@@ -39,7 +42,7 @@ class TestEnqueue:
     def test_enqueue_with_run_at(self, pq: PQ) -> None:
         """Enqueue respects custom run_at time."""
         future = datetime.now(UTC) + timedelta(hours=1)
-        task_id = pq.enqueue("my_task", run_at=future)
+        task_id = pq.enqueue(dummy_handler, run_at=future)
 
         with pq.session() as session:
             from sqlalchemy import select
@@ -48,8 +51,8 @@ class TestEnqueue:
             # Allow small time drift
             assert abs((task.run_at - future).total_seconds()) < 1
 
-    def test_enqueue_direct_function(self, pq: PQ) -> None:
-        """Enqueue with callable stores function path."""
+    def test_enqueue_stores_function_path(self, pq: PQ) -> None:
+        """Enqueue stores function path as name."""
         task_id = pq.enqueue(dummy_handler, key="value")
 
         with pq.session() as session:
@@ -60,7 +63,7 @@ class TestEnqueue:
 
     def test_enqueue_returns_int_id(self, pq: PQ) -> None:
         """Enqueue returns an integer ID."""
-        task_id = pq.enqueue("my_task")
+        task_id = pq.enqueue(dummy_handler)
         assert isinstance(task_id, int)
         assert task_id > 0
 
@@ -70,8 +73,7 @@ class TestSchedule:
 
     def test_schedule_creates_periodic(self, pq: PQ) -> None:
         """Schedule creates a periodic task."""
-        pq.register("cleanup", dummy_handler)
-        periodic_id = pq.schedule("cleanup", run_every=timedelta(hours=1))
+        periodic_id = pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
 
         assert periodic_id is not None
         assert pq.periodic_count() == 1
@@ -79,24 +81,26 @@ class TestSchedule:
     def test_schedule_stores_correct_data(self, pq: PQ) -> None:
         """Schedule stores name, payload, and run_every correctly."""
         interval = timedelta(hours=2)
-        pq.schedule("cleanup", run_every=interval, full=True)
+        pq.schedule(cleanup_handler, run_every=interval, full=True)
 
         with pq.session() as session:
             from sqlalchemy import select
 
             periodic = session.execute(
-                select(Periodic).where(Periodic.name == "cleanup")
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
             ).scalar_one()
-            assert periodic.name == "cleanup"
+            assert periodic.name == "tests.test_client:cleanup_handler"
             assert periodic.payload["kwargs"] == {"full": True}
             assert periodic.run_every == interval
             assert periodic.next_run <= datetime.now(UTC)
             assert periodic.last_run is None
 
     def test_schedule_upserts_existing(self, pq: PQ) -> None:
-        """Scheduling same name updates existing record."""
-        pq.schedule("cleanup", run_every=timedelta(hours=1))
-        pq.schedule("cleanup", run_every=timedelta(hours=2), new=True)
+        """Scheduling same function updates existing record."""
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=2), full=True)
 
         assert pq.periodic_count() == 1
 
@@ -104,10 +108,12 @@ class TestSchedule:
             from sqlalchemy import select
 
             periodic = session.execute(
-                select(Periodic).where(Periodic.name == "cleanup")
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
             ).scalar_one()
             assert periodic.run_every == timedelta(hours=2)
-            assert periodic.payload["kwargs"] == {"new": True}
+            assert periodic.payload["kwargs"] == {"full": True}
 
 
 class TestCancel:
@@ -115,7 +121,7 @@ class TestCancel:
 
     def test_cancel_removes_task(self, pq: PQ) -> None:
         """Cancel removes task from database."""
-        task_id = pq.enqueue("my_task")
+        task_id = pq.enqueue(dummy_handler)
         assert pq.pending_count() == 1
 
         result = pq.cancel(task_id)
@@ -134,38 +140,15 @@ class TestUnschedule:
 
     def test_unschedule_removes_periodic(self, pq: PQ) -> None:
         """Unschedule removes periodic task."""
-        pq.schedule("cleanup", run_every=timedelta(hours=1))
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
         assert pq.periodic_count() == 1
 
-        result = pq.unschedule("cleanup")
+        result = pq.unschedule(cleanup_handler)
 
         assert result is True
         assert pq.periodic_count() == 0
 
     def test_unschedule_nonexistent_returns_false(self, pq: PQ) -> None:
-        """Unschedule returns False for nonexistent task."""
-        result = pq.unschedule("nonexistent")
+        """Unschedule returns False for nonexistent function."""
+        result = pq.unschedule(dummy_handler)
         assert result is False
-
-
-class TestTaskDecorator:
-    """Tests for @pq.task decorator."""
-
-    def test_decorator_registers_handler(self, pq: PQ) -> None:
-        """Decorator registers handler in registry."""
-
-        @pq.task("decorated_task")
-        def my_handler(value: int) -> None:
-            pass
-
-        handler = pq._registry.get("decorated_task")
-        assert handler is my_handler
-
-    def test_decorator_preserves_function(self, pq: PQ) -> None:
-        """Decorator returns original function unchanged."""
-
-        @pq.task("decorated_task")
-        def my_handler(value: int) -> None:
-            pass
-
-        assert my_handler.__name__ == "my_handler"

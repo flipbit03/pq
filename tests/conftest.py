@@ -8,7 +8,6 @@ from collections.abc import Generator
 import pytest
 
 from pq.client import PQ
-from pq.registry import TaskRegistry
 
 
 @pytest.fixture
@@ -17,12 +16,6 @@ def db_url() -> str:
     return os.environ.get(
         "PQ_DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/postgres"
     )
-
-
-@pytest.fixture
-def registry() -> TaskRegistry:
-    """Fresh task registry for each test."""
-    return TaskRegistry()
 
 
 @pytest.fixture

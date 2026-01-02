@@ -21,6 +21,7 @@ from loguru import logger
 from sqlalchemy import func, select
 
 from pq.models import Periodic, Task, TaskStatus
+from pq.registry import resolve_function_path
 from pq.serialization import deserialize
 
 if TYPE_CHECKING:
@@ -288,7 +289,7 @@ def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
     session = pq._session_factory()
     start = time.perf_counter()
     try:
-        handler = pq._registry.resolve(name)
+        handler = resolve_function_path(name)
         args, kwargs = deserialize(payload)
         _execute_in_fork(handler, args, kwargs, max_runtime=max_runtime)
         elapsed = time.perf_counter() - start
@@ -413,7 +414,7 @@ def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
     if name is not None:
         start = time.perf_counter()
         try:
-            handler = pq._registry.resolve(name)
+            handler = resolve_function_path(name)
             args, kwargs = deserialize(payload)
             _execute_in_fork(handler, args, kwargs, max_runtime=max_runtime)
             elapsed = time.perf_counter() - start

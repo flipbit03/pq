@@ -6,6 +6,7 @@ All tests use multiprocessing shared state since tasks run in forked processes.
 import asyncio
 import multiprocessing
 import multiprocessing.managers
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -28,10 +29,73 @@ def _set_shared_calls(calls: Any) -> None:
     _shared_calls = calls
 
 
-# Global handler for testing direct function import - must be defined before use
+# Module-level handlers for testing (must be importable)
+def capture_handler(value: int) -> None:
+    """Capture a value to shared state."""
+    _shared_results.append(value)
+
+
+def noop_handler() -> None:
+    """Do nothing."""
+    pass
+
+
+def failing_handler() -> None:
+    """Always fails."""
+    raise ValueError("boom")
+
+
 def tracked_handler(key: str) -> None:
-    """Handler that tracks calls for testing."""
+    """Track calls for testing."""
     _shared_calls.append((key,))
+
+
+def ordered_handler(n: int) -> None:
+    """Append n to results for ordering tests."""
+    _shared_results.append(n)
+
+
+def periodic_handler(n: int) -> None:
+    """Periodic task handler."""
+    _shared_results.append(n)
+
+
+def periodic_noop_handler() -> None:
+    """Periodic noop handler."""
+    pass
+
+
+def counter_handler() -> None:
+    """Counter handler for periodic tests."""
+    _shared_results.append(1)
+
+
+async def async_capture_handler(value: str) -> None:
+    """Async handler that captures a value."""
+    await asyncio.sleep(0.01)
+    _shared_results.append(value)
+
+
+async def async_periodic_handler(n: int) -> None:
+    """Async periodic handler."""
+    await asyncio.sleep(0.01)
+    _shared_results.append(n)
+
+
+async def async_failing_handler() -> None:
+    """Async handler that fails."""
+    await asyncio.sleep(0.01)
+    raise ValueError("async boom")
+
+
+async def slow_async_handler() -> None:
+    """Async handler that takes too long."""
+    await asyncio.sleep(10)
+
+
+def slow_sync_handler() -> None:
+    """Sync handler that takes too long."""
+    time.sleep(10)
 
 
 class TestRunWorkerOnce:
@@ -44,11 +108,7 @@ class TestRunWorkerOnce:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("capture")
-        def capture(value: int) -> None:
-            _shared_results.append(value)
-
-        pq.enqueue("capture", value=42)
+        pq.enqueue(capture_handler, value=42)
         processed = pq.run_worker_once()
 
         assert processed is True
@@ -56,12 +116,7 @@ class TestRunWorkerOnce:
 
     def test_deletes_task_after_processing(self, pq: PQ) -> None:
         """Worker marks task completed after processing."""
-
-        @pq.task("my_task")
-        def handler() -> None:
-            pass
-
-        pq.enqueue("my_task")
+        pq.enqueue(noop_handler)
         assert pq.pending_count() == 1
 
         pq.run_worker_once()
@@ -70,13 +125,8 @@ class TestRunWorkerOnce:
 
     def test_skips_future_task(self, pq: PQ) -> None:
         """Worker skips tasks scheduled for the future."""
-
-        @pq.task("future_task")
-        def handler() -> None:
-            pass
-
         future = datetime.now(UTC) + timedelta(hours=1)
-        pq.enqueue("future_task", run_at=future)
+        pq.enqueue(noop_handler, run_at=future)
 
         processed = pq.run_worker_once()
 
@@ -90,12 +140,7 @@ class TestRunWorkerOnce:
 
     def test_deletes_task_on_failure(self, pq: PQ) -> None:
         """Worker marks task failed when handler fails."""
-
-        @pq.task("failing_task")
-        def handler() -> None:
-            raise ValueError("boom")
-
-        pq.enqueue("failing_task")
+        pq.enqueue(failing_handler)
         assert pq.pending_count() == 1
 
         pq.run_worker_once()
@@ -121,14 +166,10 @@ class TestRunWorkerOnce:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("ordered")
-        def handler(n: int) -> None:
-            _shared_results.append(n)
-
         # Enqueue in reverse priority order
-        pq.enqueue("ordered", n=3, priority=Priority.LOW)
-        pq.enqueue("ordered", n=1, priority=Priority.HIGH)
-        pq.enqueue("ordered", n=2, priority=Priority.NORMAL)
+        pq.enqueue(ordered_handler, n=3, priority=Priority.LOW)
+        pq.enqueue(ordered_handler, n=1, priority=Priority.HIGH)
+        pq.enqueue(ordered_handler, n=2, priority=Priority.NORMAL)
 
         pq.run_worker_once()
         pq.run_worker_once()
@@ -148,11 +189,7 @@ class TestPeriodicTasks:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("periodic")
-        def handler(n: int) -> None:
-            _shared_results.append(n)
-
-        pq.schedule("periodic", run_every=timedelta(hours=1), n=1)
+        pq.schedule(periodic_handler, run_every=timedelta(hours=1), n=1)
 
         processed = pq.run_worker_once()
 
@@ -163,15 +200,13 @@ class TestPeriodicTasks:
         """Worker advances next_run after processing."""
         from sqlalchemy import select
 
-        @pq.task("periodic")
-        def handler() -> None:
-            pass
-
-        pq.schedule("periodic", run_every=timedelta(hours=1))
+        pq.schedule(periodic_noop_handler, run_every=timedelta(hours=1))
 
         with pq.session() as session:
             periodic = session.execute(
-                select(Periodic).where(Periodic.name == "periodic")
+                select(Periodic).where(
+                    Periodic.name == "tests.test_worker:periodic_noop_handler"
+                )
             ).scalar_one()
             original_next_run = periodic.next_run
 
@@ -179,7 +214,9 @@ class TestPeriodicTasks:
 
         with pq.session() as session:
             periodic = session.execute(
-                select(Periodic).where(Periodic.name == "periodic")
+                select(Periodic).where(
+                    Periodic.name == "tests.test_worker:periodic_noop_handler"
+                )
             ).scalar_one()
             assert periodic.next_run > original_next_run
             # Should be ~1 hour in the future
@@ -190,15 +227,13 @@ class TestPeriodicTasks:
         """Worker sets last_run after processing."""
         from sqlalchemy import select
 
-        @pq.task("periodic")
-        def handler() -> None:
-            pass
-
-        pq.schedule("periodic", run_every=timedelta(hours=1))
+        pq.schedule(periodic_noop_handler, run_every=timedelta(hours=1))
 
         with pq.session() as session:
             periodic = session.execute(
-                select(Periodic).where(Periodic.name == "periodic")
+                select(Periodic).where(
+                    Periodic.name == "tests.test_worker:periodic_noop_handler"
+                )
             ).scalar_one()
             assert periodic.last_run is None
 
@@ -206,7 +241,9 @@ class TestPeriodicTasks:
 
         with pq.session() as session:
             periodic = session.execute(
-                select(Periodic).where(Periodic.name == "periodic")
+                select(Periodic).where(
+                    Periodic.name == "tests.test_worker:periodic_noop_handler"
+                )
             ).scalar_one()
             assert periodic.last_run is not None
 
@@ -214,17 +251,13 @@ class TestPeriodicTasks:
         """Worker skips periodic tasks not yet due."""
         from sqlalchemy import update
 
-        @pq.task("periodic")
-        def handler() -> None:
-            pass
-
-        pq.schedule("periodic", run_every=timedelta(hours=1))
+        pq.schedule(periodic_noop_handler, run_every=timedelta(hours=1))
 
         # Move next_run to the future
         with pq.session() as session:
             session.execute(
                 update(Periodic)
-                .where(Periodic.name == "periodic")
+                .where(Periodic.name == "tests.test_worker:periodic_noop_handler")
                 .values(next_run=datetime.now(UTC) + timedelta(hours=1))
             )
 
@@ -239,12 +272,8 @@ class TestPeriodicTasks:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("counter")
-        def counter() -> None:
-            _shared_results.append(1)
-
         # Schedule with 0 interval so it's always ready
-        pq.schedule("counter", run_every=timedelta(seconds=0))
+        pq.schedule(counter_handler, run_every=timedelta(seconds=0))
 
         pq.run_worker_once()
         pq.run_worker_once()
@@ -257,15 +286,13 @@ class TestPeriodicTasks:
         """Periodic task advances schedule even on failure."""
         from sqlalchemy import select
 
-        @pq.task("failing")
-        def handler() -> None:
-            raise ValueError("boom")
-
-        pq.schedule("failing", run_every=timedelta(hours=1))
+        pq.schedule(failing_handler, run_every=timedelta(hours=1))
 
         with pq.session() as session:
             periodic = session.execute(
-                select(Periodic).where(Periodic.name == "failing")
+                select(Periodic).where(
+                    Periodic.name == "tests.test_worker:failing_handler"
+                )
             ).scalar_one()
             original_next_run = periodic.next_run
 
@@ -273,7 +300,9 @@ class TestPeriodicTasks:
 
         with pq.session() as session:
             periodic = session.execute(
-                select(Periodic).where(Periodic.name == "failing")
+                select(Periodic).where(
+                    Periodic.name == "tests.test_worker:failing_handler"
+                )
             ).scalar_one()
             assert periodic.next_run > original_next_run
 
@@ -286,18 +315,14 @@ class TestPeriodicTasks:
         count = manager.list()
         _set_shared_results(count)
 
-        @pq.task("overdue")
-        def handler() -> None:
-            _shared_results.append(1)
-
         # Schedule with 1 hour interval
-        pq.schedule("overdue", run_every=timedelta(hours=1))
+        pq.schedule(counter_handler, run_every=timedelta(hours=1))
 
         # Manually set next_run to 3 hours ago (simulating missed runs)
         with pq.session() as session:
             session.execute(
                 update(Periodic)
-                .where(Periodic.name == "overdue")
+                .where(Periodic.name == "tests.test_worker:counter_handler")
                 .values(next_run=datetime.now(UTC) - timedelta(hours=3))
             )
 
@@ -320,12 +345,7 @@ class TestAsyncTasks:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("async_task")
-        async def async_handler(value: str) -> None:
-            await asyncio.sleep(0.01)  # Simulate async work
-            _shared_results.append(value)
-
-        pq.enqueue("async_task", value="async_test")
+        pq.enqueue(async_capture_handler, value="async_test")
         processed = pq.run_worker_once()
 
         assert processed is True
@@ -338,12 +358,7 @@ class TestAsyncTasks:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("async_periodic")
-        async def async_handler(n: int) -> None:
-            await asyncio.sleep(0.01)
-            _shared_results.append(n)
-
-        pq.schedule("async_periodic", run_every=timedelta(hours=1), n=1)
+        pq.schedule(async_periodic_handler, run_every=timedelta(hours=1), n=1)
 
         processed = pq.run_worker_once()
 
@@ -352,13 +367,7 @@ class TestAsyncTasks:
 
     def test_async_task_failure_handled(self, pq: PQ) -> None:
         """Worker handles async task failures correctly."""
-
-        @pq.task("async_failing")
-        async def async_handler() -> None:
-            await asyncio.sleep(0.01)
-            raise ValueError("async boom")
-
-        pq.enqueue("async_failing")
+        pq.enqueue(async_failing_handler)
         assert pq.pending_count() == 1
 
         pq.run_worker_once()
@@ -372,12 +381,7 @@ class TestTaskTimeout:
 
     def test_async_task_timeout(self, pq: PQ) -> None:
         """Async task that exceeds timeout is terminated."""
-
-        @pq.task("slow_async")
-        async def slow_handler() -> None:
-            await asyncio.sleep(10)  # Would take 10 seconds
-
-        pq.enqueue("slow_async")
+        pq.enqueue(slow_async_handler)
         # Use 0.1 second timeout - task should timeout
         pq.run_worker_once(max_runtime=0.1)
 
@@ -386,13 +390,7 @@ class TestTaskTimeout:
 
     def test_sync_task_timeout(self, pq: PQ) -> None:
         """Sync task that exceeds timeout is terminated."""
-        import time
-
-        @pq.task("slow_sync")
-        def slow_handler() -> None:
-            time.sleep(10)  # Would take 10 seconds
-
-        pq.enqueue("slow_sync")
+        pq.enqueue(slow_sync_handler)
         # Use 1 second timeout (SIGALRM has 1-second granularity)
         pq.run_worker_once(max_runtime=1)
 

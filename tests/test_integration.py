@@ -20,6 +20,8 @@ from pq.client import PQ
 # These are set up by fixtures and accessed by task handlers in child processes
 _shared_results: Any = None
 _shared_count: Any = None
+_one_off_results: Any = None
+_periodic_results: Any = None
 
 
 def _set_shared_results(results: Any) -> None:
@@ -32,6 +34,94 @@ def _set_shared_count(count: Any) -> None:
     _shared_count = count
 
 
+# Module-level handlers for testing (must be importable)
+def capture_handler(value: int) -> None:
+    """Capture a value to shared state."""
+    _shared_results.append(value)
+
+
+def delayed_handler(v: int) -> None:
+    """Handler for delayed tasks."""
+    pass
+
+
+def counter_handler() -> None:
+    """Counter handler for periodic tests."""
+    _shared_count.append(1)
+
+
+def once_handler(task_id: int) -> None:
+    """Handler that runs once per task."""
+    _shared_results.append(task_id)
+    time.sleep(0.1)  # Simulate work
+
+
+def work_handler(task_id: int) -> None:
+    """Work handler for concurrent tests."""
+    time.sleep(0.05)  # Simulate work
+    _shared_results.append(task_id)
+
+
+def fail_handler() -> None:
+    """Handler that always fails."""
+    raise ValueError("boom")
+
+
+def one_off_handler(n: int) -> None:
+    """One-off task handler."""
+    _one_off_results.append(n)
+
+
+def periodic_mixed_handler(n: int) -> None:
+    """Periodic task handler for mixed tests."""
+    _periodic_results.append(n)
+
+
+def cancel_test_handler(n: int) -> None:
+    """Handler for cancel tests."""
+    pass
+
+
+def empty_handler() -> None:
+    """Handler with no arguments."""
+    _shared_results.append(True)
+
+
+def complex_kwargs_handler(**kwargs: Any) -> None:
+    """Handler that accepts complex kwargs."""
+    _shared_results.append(dict(kwargs))
+
+
+def positional_handler(a: int, b: str, c: list[int]) -> None:
+    """Handler with positional args."""
+    _shared_results.append((a, b, c))
+
+
+def mixed_args_handler(a: int, b: str, c: int = 0) -> None:
+    """Handler with mixed args and kwargs."""
+    _shared_results.append((a, b, c))
+
+
+def pydantic_handler(user: dict[str, Any]) -> None:
+    """Handler that receives Pydantic model as dict."""
+    _shared_results.append(dict(user))
+
+
+def pydantic_periodic_handler(config: dict[str, Any]) -> None:
+    """Handler for periodic Pydantic tests."""
+    _shared_results.append(dict(config))
+
+
+def pickle_handler(data: Any) -> None:
+    """Handler that receives pickled object."""
+    _shared_results.append(data.value)
+
+
+def func_handler(cb: Any) -> None:
+    """Handler that receives a function."""
+    _shared_results.append(cb(21))
+
+
 class TestEndToEnd:
     """End-to-end integration tests."""
 
@@ -42,11 +132,7 @@ class TestEndToEnd:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("capture")
-        def capture(value: int) -> None:
-            _shared_results.append(value)
-
-        pq.enqueue("capture", value=42)
+        pq.enqueue(capture_handler, value=42)
         pq.run_worker_once()
 
         assert list(results) == [42]
@@ -54,14 +140,8 @@ class TestEndToEnd:
 
     def test_scheduled_task_waits(self, pq: PQ) -> None:
         """Future task not processed until run_at."""
-        # This test doesn't need shared state - just checks task stays pending
-
-        @pq.task("delayed")
-        def delayed(v: int) -> None:
-            pass
-
         future = datetime.now(UTC) + timedelta(hours=1)
-        pq.enqueue("delayed", v=1, run_at=future)
+        pq.enqueue(delayed_handler, v=1, run_at=future)
         processed = pq.run_worker_once()
 
         assert processed is False
@@ -74,11 +154,7 @@ class TestEndToEnd:
         count = manager.list()
         _set_shared_count(count)
 
-        @pq.task("counter")
-        def counter() -> None:
-            _shared_count.append(1)
-
-        pq.schedule("counter", run_every=timedelta(seconds=0))  # Immediate
+        pq.schedule(counter_handler, run_every=timedelta(seconds=0))  # Immediate
 
         pq.run_worker_once()
         pq.run_worker_once()
@@ -93,13 +169,8 @@ class TestEndToEnd:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("once")
-        def once(task_id: int) -> None:
-            _shared_results.append(task_id)
-            time.sleep(0.1)  # Simulate work
-
         # Enqueue single task
-        pq.enqueue("once", task_id=1)
+        pq.enqueue(once_handler, task_id=1)
 
         # Two workers race
         with ThreadPoolExecutor(max_workers=2) as ex:
@@ -116,14 +187,9 @@ class TestEndToEnd:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("work")
-        def work(task_id: int) -> None:
-            time.sleep(0.05)  # Simulate work
-            _shared_results.append(task_id)
-
         # Enqueue multiple tasks
         for i in range(5):
-            pq.enqueue("work", task_id=i)
+            pq.enqueue(work_handler, task_id=i)
 
         # Process with multiple workers
         with ThreadPoolExecutor(max_workers=3) as ex:
@@ -146,12 +212,7 @@ class TestEndToEnd:
         handler_id = logger.add(log_output, format="{message}")
 
         try:
-
-            @pq.task("fail")
-            def fail() -> None:
-                raise ValueError("boom")
-
-            pq.enqueue("fail")
+            pq.enqueue(fail_handler)
             pq.run_worker_once()
 
             assert "boom" in log_output.getvalue()
@@ -163,46 +224,32 @@ class TestEndToEnd:
         self, pq: PQ, manager: multiprocessing.managers.SyncManager
     ) -> None:
         """Worker handles both one-off and periodic tasks."""
-        one_off_results = manager.list()
-        periodic_results = manager.list()
+        one_off_list = manager.list()
+        periodic_list = manager.list()
 
         # Store in globals for child process access
         global _one_off_results, _periodic_results
-        _one_off_results = one_off_results
-        _periodic_results = periodic_results
-
-        @pq.task("one_off")
-        def one_off(n: int) -> None:
-            _one_off_results.append(n)
-
-        @pq.task("periodic")
-        def periodic(n: int) -> None:
-            _periodic_results.append(n)
+        _one_off_results = one_off_list
+        _periodic_results = periodic_list
 
         # Schedule both
-        pq.enqueue("one_off", n=1)
-        pq.enqueue("one_off", n=2)
-        pq.schedule("periodic", run_every=timedelta(seconds=0), n=100)
+        pq.enqueue(one_off_handler, n=1)
+        pq.enqueue(one_off_handler, n=2)
+        pq.schedule(periodic_mixed_handler, run_every=timedelta(seconds=0), n=100)
 
         # Process all
         for _ in range(5):
             pq.run_worker_once()
 
         # One-off tasks processed once each
-        assert sorted(one_off_results) == [1, 2]
+        assert sorted(one_off_list) == [1, 2]
         # Periodic task processed multiple times
-        assert len(periodic_results) >= 3
-        assert all(n == 100 for n in periodic_results)
+        assert len(periodic_list) >= 3
+        assert all(n == 100 for n in periodic_list)
 
     def test_cancel_prevents_processing(self, pq: PQ) -> None:
         """Cancelled task is not processed."""
-        # Just verify task count - no side effects to check
-
-        @pq.task("work")
-        def work(n: int) -> None:
-            pass
-
-        task_id = pq.enqueue("work", n=1)
+        task_id = pq.enqueue(cancel_test_handler, n=1)
         pq.cancel(task_id)
 
         processed = pq.run_worker_once()
@@ -216,27 +263,18 @@ class TestEndToEnd:
         count = manager.list()
         _set_shared_count(count)
 
-        @pq.task("counter")
-        def counter() -> None:
-            _shared_count.append(1)
-
-        pq.schedule("counter", run_every=timedelta(seconds=0))
+        pq.schedule(counter_handler, run_every=timedelta(seconds=0))
 
         pq.run_worker_once()
         pq.run_worker_once()
 
-        pq.unschedule("counter")
+        pq.unschedule(counter_handler)
 
         pq.run_worker_once()
         pq.run_worker_once()
 
         # Only 2 runs before unschedule
         assert len(count) == 2
-
-
-# Additional globals for mixed test
-_one_off_results: Any = None
-_periodic_results: Any = None
 
 
 class TestPayloadTypes:
@@ -249,11 +287,7 @@ class TestPayloadTypes:
         called = manager.list()
         _set_shared_results(called)
 
-        @pq.task("empty")
-        def handler() -> None:
-            _shared_results.append(True)
-
-        pq.enqueue("empty")
+        pq.enqueue(empty_handler)
         pq.run_worker_once()
 
         assert list(called) == [True]
@@ -265,12 +299,8 @@ class TestPayloadTypes:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("complex")
-        def handler(**kwargs: Any) -> None:
-            _shared_results.append(dict(kwargs))
-
         pq.enqueue(
-            "complex",
+            complex_kwargs_handler,
             string="value",
             number=42,
             float_val=3.14,
@@ -293,11 +323,7 @@ class TestPayloadTypes:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("positional")
-        def handler(a: int, b: str, c: list[int]) -> None:
-            _shared_results.append((a, b, c))
-
-        pq.enqueue("positional", 1, "hello", [1, 2, 3])
+        pq.enqueue(positional_handler, 1, "hello", [1, 2, 3])
         pq.run_worker_once()
 
         assert list(results) == [(1, "hello", [1, 2, 3])]
@@ -309,11 +335,7 @@ class TestPayloadTypes:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("mixed")
-        def handler(a: int, b: str, c: int = 0) -> None:
-            _shared_results.append((a, b, c))
-
-        pq.enqueue("mixed", 1, "hello", c=42)
+        pq.enqueue(mixed_args_handler, 1, "hello", c=42)
         pq.run_worker_once()
 
         assert list(results) == [(1, "hello", 42)]
@@ -330,12 +352,8 @@ class TestPayloadTypes:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("pydantic")
-        def handler(user: dict[str, Any]) -> None:
-            _shared_results.append(dict(user))
-
         payload = UserPayload(user_id=123, email="test@example.com")
-        pq.enqueue("pydantic", payload)
+        pq.enqueue(pydantic_handler, payload)
         pq.run_worker_once()
 
         assert len(results) == 1
@@ -353,12 +371,8 @@ class TestPayloadTypes:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("pydantic_periodic")
-        def handler(config: dict[str, Any]) -> None:
-            _shared_results.append(dict(config))
-
         config = ReportConfig(report_type="daily", recipients=["a@b.com", "c@d.com"])
-        pq.schedule("pydantic_periodic", config, run_every=timedelta(seconds=0))
+        pq.schedule(pydantic_periodic_handler, config, run_every=timedelta(seconds=0))
         pq.run_worker_once()
 
         assert len(results) == 1
@@ -379,11 +393,7 @@ class TestPayloadTypes:
         results = manager.list()
         _set_shared_results(results)
 
-        @pq.task("pickle")
-        def handler(data: CustomData) -> None:
-            _shared_results.append(data.value)
-
-        pq.enqueue("pickle", CustomData(42))
+        pq.enqueue(pickle_handler, CustomData(42))
         pq.run_worker_once()
 
         assert list(results) == [42]
@@ -398,11 +408,7 @@ class TestPayloadTypes:
         def callback(x: int) -> int:
             return x * 2
 
-        @pq.task("func")
-        def handler(cb: Any) -> None:
-            _shared_results.append(cb(21))
-
-        pq.enqueue("func", callback)
+        pq.enqueue(func_handler, callback)
         pq.run_worker_once()
 
         assert list(results) == [42]

@@ -5,7 +5,7 @@ Postgres-backed job queue for Python with fork-based worker isolation.
 ## Features
 
 - **Fork isolation** - Each task runs in a forked process. OOM or crashes don't affect the worker.
-- **Natural Python API** - Pass `*args, **kwargs` directly. Pydantic models, custom objects, and lambdas all work.
+- **Natural Python API** - Pass `*args, **kwargs` directly. Pydantic models and custom objects work.
 - **Periodic tasks** - Schedule with intervals or cron expressions.
 - **Priority queues** - Five priority levels, higher priority tasks run first.
 - **Async support** - Async handlers work seamlessly.
@@ -27,42 +27,33 @@ from pq import PQ
 pq = PQ("postgresql://localhost/mydb")
 pq.create_tables()
 
-@pq.task("send_email")
 def send_email(to: str, subject: str, body: str) -> None:
     print(f"Sending email to {to}: {subject}")
 
-pq.enqueue("send_email", to="user@example.com", subject="Hello", body="...")
+pq.enqueue(send_email, to="user@example.com", subject="Hello", body="...")
 pq.run_worker()
 ```
 
 ## Enqueueing Tasks
 
 ```python
-# By registered name
-@pq.task("greet")
 def greet(name: str) -> None:
     print(f"Hello, {name}!")
 
-pq.enqueue("greet", name="World")
-pq.enqueue("greet", "World")  # Positional args work too
-
-# Direct function reference (no registration needed)
-def my_task(data: dict) -> None:
-    print(data)
-
-pq.enqueue(my_task, {"key": "value"})
+pq.enqueue(greet, name="World")
+pq.enqueue(greet, "World")  # Positional args work too
 
 # Delayed execution
 from datetime import datetime, timedelta, UTC
-pq.enqueue("task", run_at=datetime.now(UTC) + timedelta(hours=1))
+pq.enqueue(greet, "World", run_at=datetime.now(UTC) + timedelta(hours=1))
 
 # Priority
 from pq import Priority
-pq.enqueue("task", priority=Priority.CRITICAL)  # 100
-pq.enqueue("task", priority=Priority.HIGH)      # 75
-pq.enqueue("task", priority=Priority.NORMAL)    # 50 (default)
-pq.enqueue("task", priority=Priority.LOW)       # 25
-pq.enqueue("task", priority=Priority.BATCH)     # 0
+pq.enqueue(greet, "World", priority=Priority.CRITICAL)  # 100
+pq.enqueue(greet, "World", priority=Priority.HIGH)      # 75
+pq.enqueue(greet, "World", priority=Priority.NORMAL)    # 50 (default)
+pq.enqueue(greet, "World", priority=Priority.LOW)       # 25
+pq.enqueue(greet, "World", priority=Priority.BATCH)     # 0
 ```
 
 ## Periodic Tasks
@@ -70,17 +61,26 @@ pq.enqueue("task", priority=Priority.BATCH)     # 0
 ```python
 from datetime import timedelta
 
+def heartbeat() -> None:
+    print("alive")
+
+def weekly_report() -> None:
+    print("generating report...")
+
 # Fixed interval
-pq.schedule("heartbeat", run_every=timedelta(minutes=5))
+pq.schedule(heartbeat, run_every=timedelta(minutes=5))
 
 # Cron expression (Monday 9am)
-pq.schedule("weekly_report", cron="0 9 * * 1")
+pq.schedule(weekly_report, cron="0 9 * * 1")
 
 # With arguments
-pq.schedule("report", run_every=timedelta(hours=1), report_type="hourly")
+def report(report_type: str) -> None:
+    print(f"generating {report_type} report...")
+
+pq.schedule(report, run_every=timedelta(hours=1), report_type="hourly")
 
 # Remove schedule
-pq.unschedule("heartbeat")
+pq.unschedule(heartbeat)
 ```
 
 ## Serialization
@@ -91,7 +91,7 @@ Arguments are serialized automatically:
 |------|--------|
 | JSON-serializable (str, int, list, dict) | JSON |
 | Pydantic models | `model_dump()` → JSON |
-| Custom objects, lambdas, functions | dill (pickle) |
+| Custom objects, functions | dill (pickle) |
 
 ```python
 from pydantic import BaseModel
@@ -100,18 +100,24 @@ class User(BaseModel):
     id: int
     email: str
 
-# Pydantic model → dict, lambda → pickled
-pq.enqueue("process", User(id=1, email="a@b.com"), transform=lambda x: x * 2)
+def process(user: dict, transform: callable) -> None:
+    print(transform(user))
+
+# Pydantic model → dict, function → pickled
+pq.enqueue(process, User(id=1, email="a@b.com"), transform=lambda x: x["id"] * 2)
 ```
 
 ## Async Tasks
 
 ```python
-@pq.task("fetch")
+import httpx
+
 async def fetch(url: str) -> None:
     async with httpx.AsyncClient() as client:
         response = await client.get(url)
         print(response.status_code)
+
+pq.enqueue(fetch, "https://example.com")
 ```
 
 ## Worker
@@ -131,8 +137,11 @@ pq.run_worker(max_runtime=300)
 ## Task Management
 
 ```python
+def my_task() -> None:
+    pass
+
 # Cancel a pending task
-task_id = pq.enqueue("task")
+task_id = pq.enqueue(my_task)
 pq.cancel(task_id)
 
 # Counts

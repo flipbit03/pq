@@ -14,57 +14,42 @@ Usage:
     uv run examples/full.py status          # Show queue status
     uv run examples/full.py clear           # Clear all tasks
 
-=== REGISTRATION METHODS ===
+=== ENQUEUEING TASKS ===
 
-1. Decorator (recommended):
-    @pq.task("task_name")
-    def my_handler(arg1, arg2, kwarg=value): ...
+Pass the function directly:
+    pq.enqueue(my_handler, arg1, arg2, kwarg=value)
 
-2. Explicit registration:
-    def my_handler(arg1, arg2): ...
-    pq.register("task_name", my_handler)
+With positional and keyword args:
+    pq.enqueue(greet, "World")
+    pq.enqueue(greet, name="World")
 
-3. Direct function (no registration needed):
-    pq.enqueue(my_handler, arg1, arg2)  # Uses module:function path
+Run at specific time:
+    pq.enqueue(greet, "Future", run_at=datetime(...))
 
-4. Imported function (cross-module):
+From imported module:
     from examples.tasks import external_task
-    pq.enqueue(external_task, data)  # Stores "examples.tasks:external_task"
-
-=== ENQUEUEING METHODS ===
-
-1. By registered name with kwargs:
-    pq.enqueue("task_name", key="value", other=123)
-
-2. With positional args:
-    pq.enqueue("task_name", arg1, arg2, kwarg=value)
-
-3. Run at specific time:
-    pq.enqueue("task_name", arg1, run_at=datetime(...))
-
-4. Direct function reference:
-    pq.enqueue(some_function, arg1, arg2)
+    pq.enqueue(external_task, data)
 
 === PERIODIC TASKS ===
 
-1. Schedule recurring task:
-    pq.schedule("task_name", run_every=timedelta(hours=1))
+Schedule recurring task:
+    pq.schedule(tick, run_every=timedelta(hours=1))
 
-2. With arguments:
-    pq.schedule("task_name", run_every=timedelta(minutes=5), report_type="daily")
+With arguments:
+    pq.schedule(report, run_every=timedelta(minutes=5), report_type="daily")
 
-3. Remove schedule:
-    pq.unschedule("task_name")
+Remove schedule:
+    pq.unschedule(tick)
 
 === PRIORITY ===
 
 Priority levels (higher value = higher priority):
     from pq import Priority
-    pq.enqueue("task", priority=Priority.CRITICAL)  # 100
-    pq.enqueue("task", priority=Priority.HIGH)      # 75
-    pq.enqueue("task", priority=Priority.NORMAL)    # 50 (default)
-    pq.enqueue("task", priority=Priority.LOW)       # 25
-    pq.enqueue("task", priority=Priority.BATCH)     # 0
+    pq.enqueue(task, priority=Priority.CRITICAL)  # 100
+    pq.enqueue(task, priority=Priority.HIGH)      # 75
+    pq.enqueue(task, priority=Priority.NORMAL)    # 50 (default)
+    pq.enqueue(task, priority=Priority.LOW)       # 25
+    pq.enqueue(task, priority=Priority.BATCH)     # 0
 """
 
 import asyncio
@@ -92,78 +77,63 @@ pq.create_tables()
 
 
 # =============================================================================
-# TASK HANDLERS - Multiple registration methods
+# TASK HANDLERS
 # =============================================================================
 
 
-# Method 1: Decorator (recommended)
-@pq.task("greet")
 def greet(name: str) -> None:
     """Simple greeting task."""
-    logger.info(f"👋 Hello, {name}!")
+    logger.info(f"Hello, {name}!")
 
 
-@pq.task("add")
 def add(a: int, b: int) -> None:
     """Math task."""
     result = a + b
-    logger.info(f"🔢 {a} + {b} = {result}")
+    logger.info(f"{a} + {b} = {result}")
 
 
-@pq.task("tick")
 def tick() -> None:
     """Periodic heartbeat task."""
-    logger.info("⏰ Tick!")
+    logger.info("Tick!")
 
 
-@pq.task("report")
 def report(report_type: str = "default") -> None:
     """Periodic report task with payload."""
-    logger.info(f"📊 Generating {report_type} report...")
+    logger.info(f"Generating {report_type} report...")
 
 
-@pq.task("flaky")
 def flaky_task(reason: str = "unknown") -> None:
     """Task that fails - demonstrates error handling."""
-    logger.info("💥 About to fail...")
+    logger.info("About to fail...")
     raise ValueError(f"Simulated error: {reason}")
 
 
-@pq.task("async_greet")
 async def async_greet(name: str) -> None:
     """Async greeting task - demonstrates async handler support."""
     await asyncio.sleep(0.1)  # Simulate async I/O
-    logger.info(f"👋 [async] Hello, {name}!")
+    logger.info(f"[async] Hello, {name}!")
 
 
-@pq.task("async_fetch")
 async def async_fetch(url: str = "unknown") -> None:
     """Simulates async data fetching."""
     await asyncio.sleep(0.2)  # Simulate network delay
-    logger.info(f"📡 [async] Fetched data for: {url}")
+    logger.info(f"[async] Fetched data for: {url}")
 
 
-# Method 2: Explicit registration
 def send_email(to: str, subject: str) -> None:
-    """Email task registered explicitly."""
-    logger.info(f"📧 Sending email to {to}: {subject}")
+    """Email task."""
+    logger.info(f"Sending email to {to}: {subject}")
 
 
-pq.register("send_email", send_email)
-
-
-# Method 3: Direct function (no registration needed - uses import path)
 def standalone_task(data: Any) -> None:
-    """Task that doesn't need prior registration."""
-    logger.info(f"🚀 Standalone task executed with: {data}")
+    """Task that demonstrates direct function reference."""
+    logger.info(f"Standalone task executed with: {data}")
 
 
-# Task demonstrating pickle serialization for non-JSON types
-@pq.task("process_with_callback")
 def process_with_callback(data: Any, transformer: Any) -> None:
-    """Task that receives a custom object (pickled arg) and callback (pickled kwarg)."""
+    """Task that receives a custom object and callback (both pickled)."""
     result = transformer(data.total)
-    logger.info(f"🔄 Processed: DataBundle.total={data.total} -> transformed={result}")
+    logger.info(f"Processed: DataBundle.total={data.total} -> transformed={result}")
 
 
 # =============================================================================
@@ -183,53 +153,42 @@ def cmd_full() -> None:
     pq.clear_all()
     logger.info("[1/10] CLEARED - Starting fresh")
 
-    # === Registration Methods ===
-    logger.info("[2/10] REGISTRATION METHODS")
-    logger.info("-" * 40)
-    logger.info("✓ @pq.task('greet') - Decorator registration")
-    logger.info("✓ pq.register('send_email', fn) - Explicit registration")
-    logger.info("✓ standalone_task - Direct function (same module)")
-    logger.info("✓ external_task - Imported function (cross-module)")
-    logger.info("")
-
     # === One-off Tasks ===
-    logger.info("[3/10] ENQUEUEING ONE-OFF TASKS")
+    logger.info("[2/10] ENQUEUEING ONE-OFF TASKS")
     logger.info("-" * 40)
 
-    # By name (decorator-registered)
-    id1 = pq.enqueue("greet", name="World")
-    logger.info(f"Enqueued 'greet' by name -> id={id1}")
+    # Direct function reference
+    id1 = pq.enqueue(greet, name="World")
+    logger.info(f"Enqueued greet -> id={id1}")
 
-    # By name (explicitly registered)
-    id2 = pq.enqueue("send_email", to="alice@test.com", subject="Hello!")
-    logger.info(f"Enqueued 'send_email' by name -> id={id2}")
+    id2 = pq.enqueue(send_email, to="alice@test.com", subject="Hello!")
+    logger.info(f"Enqueued send_email -> id={id2}")
 
-    # Direct function reference (same module)
     id3 = pq.enqueue(standalone_task, {"data": "direct_call"})
-    logger.info(f"Enqueued standalone_task directly -> id={id3}")
+    logger.info(f"Enqueued standalone_task -> id={id3}")
 
     # Imported function reference (cross-module)
     id4 = pq.enqueue(external_task, {"source": "imported"})
     logger.info(f"Enqueued external_task (imported) -> id={id4}")
 
     # Math task
-    id5 = pq.enqueue("add", a=100, b=200)
-    logger.info(f"Enqueued 'add' by name -> id={id5}")
+    id5 = pq.enqueue(add, a=100, b=200)
+    logger.info(f"Enqueued add -> id={id5}")
 
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Delayed Task ===
-    logger.info("[4/10] DELAYED TASK (run_at)")
+    logger.info("[3/10] DELAYED TASK (run_at)")
     logger.info("-" * 40)
     run_at = datetime.now(UTC) + timedelta(seconds=3)
-    id6 = pq.enqueue("greet", name="Future", run_at=run_at)
+    id6 = pq.enqueue(greet, name="Future", run_at=run_at)
     logger.info(f"Scheduled for {run_at.strftime('%H:%M:%S')} -> id={id6}")
     logger.info(f"Total pending: {pq.pending_count()}\n")
 
     # === Cancellation ===
-    logger.info("[5/10] TASK CANCELLATION")
+    logger.info("[4/10] TASK CANCELLATION")
     logger.info("-" * 40)
-    cancel_id = pq.enqueue("greet", name="WillBeCancelled")
+    cancel_id = pq.enqueue(greet, name="WillBeCancelled")
     logger.info(f"Enqueued task -> id={cancel_id}")
     logger.info(f"Pending before cancel: {pq.pending_count()}")
     pq.cancel(cancel_id)
@@ -237,27 +196,27 @@ def cmd_full() -> None:
     logger.info(f"Pending after cancel: {pq.pending_count()}\n")
 
     # === Error Handling ===
-    logger.info("[6/10] ERROR HANDLING")
+    logger.info("[5/10] ERROR HANDLING")
     logger.info("-" * 40)
-    pq.enqueue("flaky", reason="demo failure")
+    pq.enqueue(flaky_task, reason="demo failure")
     logger.info("Enqueued flaky task (will fail)")
     pq.run_worker_once()  # This will log the error but continue
     logger.info("Worker continued after error (task marked failed)\n")
 
     # === Async Tasks ===
-    logger.info("[7/10] ASYNC TASKS")
+    logger.info("[6/10] ASYNC TASKS")
     logger.info("-" * 40)
-    id_async1 = pq.enqueue("async_greet", name="Async World")
-    logger.info(f"Enqueued 'async_greet' -> id={id_async1}")
-    id_async2 = pq.enqueue("async_fetch", url="https://api.example.com")
-    logger.info(f"Enqueued 'async_fetch' -> id={id_async2}")
+    id_async1 = pq.enqueue(async_greet, name="Async World")
+    logger.info(f"Enqueued async_greet -> id={id_async1}")
+    id_async2 = pq.enqueue(async_fetch, url="https://api.example.com")
+    logger.info(f"Enqueued async_fetch -> id={id_async2}")
     logger.info("Processing async tasks...")
     pq.run_worker_once()
     pq.run_worker_once()
     logger.info("Async tasks completed\n")
 
     # === Pickle Serialization (non-JSON types) ===
-    logger.info("[8/10] PICKLE SERIALIZATION (lambdas, custom objects)")
+    logger.info("[7/10] PICKLE SERIALIZATION (lambdas, custom objects)")
     logger.info("-" * 40)
 
     # Custom class instance as positional arg (pickled)
@@ -272,23 +231,23 @@ def cmd_full() -> None:
     # Lambda as keyword arg (pickled)
     doubler = lambda x: x * 2  # noqa: E731
 
-    id_pickle = pq.enqueue("process_with_callback", bundle, transformer=doubler)
+    id_pickle = pq.enqueue(process_with_callback, bundle, transformer=doubler)
     logger.info(f"Enqueued task with pickled arg + kwarg -> id={id_pickle}")
 
     pq.run_worker_once()
     logger.info("Pickle serialization demo complete\n")
 
     # === Periodic Tasks ===
-    logger.info("[9/10] PERIODIC TASKS")
+    logger.info("[8/10] PERIODIC TASKS")
     logger.info("-" * 40)
-    pq.schedule("tick", run_every=timedelta(seconds=2))
-    logger.info("Scheduled 'tick' every 2 seconds")
-    pq.schedule("report", run_every=timedelta(seconds=4), report_type="status")
-    logger.info("Scheduled 'report' every 4 seconds with payload")
+    pq.schedule(tick, run_every=timedelta(seconds=2))
+    logger.info("Scheduled tick every 2 seconds")
+    pq.schedule(report, run_every=timedelta(seconds=4), report_type="status")
+    logger.info("Scheduled report every 4 seconds with payload")
     logger.info(f"Periodic count: {pq.periodic_count()}\n")
 
     # === Process Everything ===
-    logger.info("[10/10] PROCESSING")
+    logger.info("[9/10] PROCESSING")
     logger.info("-" * 40)
     logger.info("Processing one-off tasks...")
 
@@ -309,9 +268,11 @@ def cmd_full() -> None:
         time.sleep(0.5)
 
     # Unschedule periodic
+    logger.info("[10/10] CLEANUP")
+    logger.info("-" * 40)
     logger.info("Unscheduling periodic tasks...")
-    pq.unschedule("tick")
-    pq.unschedule("report")
+    pq.unschedule(tick)
+    pq.unschedule(report)
 
     # Final status
     logger.info("" + "=" * 60)
@@ -319,7 +280,7 @@ def cmd_full() -> None:
     logger.info("=" * 60)
     logger.info(f"Pending one-off: {pq.pending_count()}")
     logger.info(f"Periodic schedules: {pq.periodic_count()}")
-    logger.info("✅ Full showcase complete!")
+    logger.info("Full showcase complete!")
 
 
 def cmd_demo() -> None:
@@ -332,14 +293,9 @@ def cmd_demo() -> None:
     # Enqueue various tasks
     logger.info("Enqueueing tasks...")
 
-    # By name (decorator-registered)
-    pq.enqueue("greet", name="World")
-    pq.enqueue("add", a=10, b=20)
-
-    # By name (explicitly registered)
-    pq.enqueue("send_email", to="user@example.com", subject="Hello!")
-
-    # Direct function reference (no prior registration)
+    pq.enqueue(greet, name="World")
+    pq.enqueue(add, a=10, b=20)
+    pq.enqueue(send_email, to="user@example.com", subject="Hello!")
     pq.enqueue(standalone_task, {"data": "test"})
 
     logger.info(f"Queued {pq.pending_count()} tasks")
@@ -349,24 +305,21 @@ def cmd_demo() -> None:
     while pq.run_worker_once():
         pass
 
-    logger.info("✅ Demo complete!")
+    logger.info("Demo complete!")
 
 
 def cmd_enqueue() -> None:
     """Enqueue one-off tasks using various methods."""
     logger.info("=== Enqueueing One-Off Tasks ===")
 
-    # Method 1: By registered name
-    task_id = pq.enqueue("greet", name="Alice")
-    logger.info(f"Enqueued 'greet' by name -> id={task_id}")
+    task_id = pq.enqueue(greet, name="Alice")
+    logger.info(f"Enqueued greet -> id={task_id}")
 
-    # Method 2: By explicitly registered name
-    task_id = pq.enqueue("send_email", to="bob@test.com", subject="Hi")
-    logger.info(f"Enqueued 'send_email' by name -> id={task_id}")
+    task_id = pq.enqueue(send_email, to="bob@test.com", subject="Hi")
+    logger.info(f"Enqueued send_email -> id={task_id}")
 
-    # Method 3: Direct function reference
     task_id = pq.enqueue(standalone_task, {"key": "value"})
-    logger.info(f"Enqueued standalone_task directly -> id={task_id}")
+    logger.info(f"Enqueued standalone_task -> id={task_id}")
 
     logger.info(f"Total pending: {pq.pending_count()}")
 
@@ -377,7 +330,7 @@ def cmd_delayed() -> None:
 
     # Schedule task for 10 seconds from now
     run_at = datetime.now(UTC) + timedelta(seconds=10)
-    task_id = pq.enqueue("greet", name="Future", run_at=run_at)
+    task_id = pq.enqueue(greet, name="Future", run_at=run_at)
 
     logger.info(f"Scheduled task for {run_at.strftime('%H:%M:%S')} -> id={task_id}")
     logger.info("Run 'work' command to process when ready")
@@ -387,13 +340,11 @@ def cmd_schedule() -> None:
     """Schedule periodic tasks."""
     logger.info("=== Scheduling Periodic Tasks ===")
 
-    # Simple periodic task
-    pq.schedule("tick", run_every=timedelta(seconds=5))
-    logger.info("Scheduled 'tick' every 5 seconds")
+    pq.schedule(tick, run_every=timedelta(seconds=5))
+    logger.info("Scheduled tick every 5 seconds")
 
-    # Periodic task with payload
-    pq.schedule("report", run_every=timedelta(seconds=10), report_type="hourly")
-    logger.info("Scheduled 'report' every 10 seconds with payload")
+    pq.schedule(report, run_every=timedelta(seconds=10), report_type="hourly")
+    logger.info("Scheduled report every 10 seconds with payload")
 
     logger.info(f"Total periodic schedules: {pq.periodic_count()}")
     logger.info("Run 'work' command to start processing")
@@ -403,12 +354,10 @@ def cmd_cancel() -> None:
     """Demo cancelling a task before it runs."""
     logger.info("=== Cancel Demo ===")
 
-    # Enqueue a task
-    task_id = pq.enqueue("greet", name="NeverRuns")
+    task_id = pq.enqueue(greet, name="NeverRuns")
     logger.info(f"Enqueued task -> id={task_id}")
     logger.info(f"Pending count: {pq.pending_count()}")
 
-    # Cancel it
     result = pq.cancel(task_id)
     logger.info(f"Cancelled: {result}")
     logger.info(f"Pending count: {pq.pending_count()}")
@@ -418,12 +367,10 @@ def cmd_unschedule() -> None:
     """Demo removing a periodic task."""
     logger.info("=== Unschedule Demo ===")
 
-    # Schedule a task
-    pq.schedule("tick", run_every=timedelta(seconds=5))
-    logger.info(f"Scheduled 'tick'. Periodic count: {pq.periodic_count()}")
+    pq.schedule(tick, run_every=timedelta(seconds=5))
+    logger.info(f"Scheduled tick. Periodic count: {pq.periodic_count()}")
 
-    # Remove it
-    result = pq.unschedule("tick")
+    result = pq.unschedule(tick)
     logger.info(f"Unscheduled: {result}")
     logger.info(f"Periodic count: {pq.periodic_count()}")
 

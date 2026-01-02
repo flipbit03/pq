@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from pq.models import Base, Periodic, Task, TaskStatus
 from pq.priority import Priority
-from pq.registry import TaskRegistry, get_function_path
+from pq.registry import get_function_path
 from pq.serialization import serialize
 
 
@@ -28,7 +28,6 @@ class PQ:
         """
         self._engine: Engine = create_engine(database_url)
         self._session_factory = sessionmaker(bind=self._engine)
-        self._registry = TaskRegistry()
 
     @contextmanager
     def session(self) -> Any:
@@ -57,34 +56,9 @@ class PQ:
             session.execute(delete(Task))
             session.execute(delete(Periodic))
 
-    def task(self, name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Decorator to register a task handler.
-
-        Args:
-            name: Task name to register.
-
-        Returns:
-            Decorator function.
-        """
-
-        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-            self._registry.register(name, func)
-            return func
-
-        return decorator
-
-    def register(self, name: str, handler: Callable[..., Any]) -> None:
-        """Register a task handler explicitly.
-
-        Args:
-            name: Task name.
-            handler: Function to call with task arguments.
-        """
-        self._registry.register(name, handler)
-
     def enqueue(
         self,
-        task: str | Callable[..., Any],
+        task: Callable[..., Any],
         *args: Any,
         run_at: datetime | None = None,
         priority: Priority = Priority.NORMAL,
@@ -93,7 +67,7 @@ class PQ:
         """Enqueue a one-off task.
 
         Args:
-            task: Task name (string) or callable function.
+            task: Callable function to execute.
             *args: Positional arguments to pass to the handler.
             run_at: When to run the task. Defaults to now.
             priority: Task priority. Higher = higher priority. Defaults to NORMAL.
@@ -101,12 +75,11 @@ class PQ:
 
         Returns:
             Task ID.
-        """
-        if callable(task):
-            name = get_function_path(task)
-        else:
-            name = task
 
+        Raises:
+            ValueError: If task is a lambda, closure, or cannot be imported.
+        """
+        name = get_function_path(task)
         payload = serialize(args, kwargs)
 
         if run_at is None:
@@ -121,7 +94,7 @@ class PQ:
 
     def schedule(
         self,
-        name: str,
+        task: Callable[..., Any],
         *args: Any,
         run_every: timedelta | None = None,
         cron: str | None = None,
@@ -130,11 +103,11 @@ class PQ:
     ) -> int:
         """Schedule a periodic task.
 
-        If a periodic task with this name already exists, it will be updated.
+        If a periodic task with this function already exists, it will be updated.
         Either run_every or cron must be provided, but not both.
 
         Args:
-            name: Task name.
+            task: Callable function to execute.
             *args: Positional arguments to pass to the handler.
             run_every: Interval between executions (e.g., timedelta(hours=1)).
             cron: Cron expression (e.g., "0 9 * * 1" for Monday 9am).
@@ -146,12 +119,14 @@ class PQ:
 
         Raises:
             ValueError: If neither run_every nor cron is provided, or if both are.
+            ValueError: If task is a lambda, closure, or cannot be imported.
         """
         if run_every is None and cron is None:
             raise ValueError("Either run_every or cron must be provided")
         if run_every is not None and cron is not None:
             raise ValueError("Only one of run_every or cron can be provided")
 
+        name = get_function_path(task)
         payload = serialize(args, kwargs)
 
         # Calculate next_run based on cron or interval
@@ -202,15 +177,16 @@ class PQ:
             result = session.execute(stmt)
             return result.rowcount > 0
 
-    def unschedule(self, name: str) -> bool:
-        """Remove a periodic task by name.
+    def unschedule(self, task: Callable[..., Any]) -> bool:
+        """Remove a periodic task.
 
         Args:
-            name: Task name.
+            task: The scheduled function to remove.
 
         Returns:
             True if task was found and deleted, False otherwise.
         """
+        name = get_function_path(task)
         with self.session() as session:
             stmt = delete(Periodic).where(Periodic.name == name)
             result = session.execute(stmt)
