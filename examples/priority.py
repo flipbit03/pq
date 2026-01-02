@@ -17,11 +17,11 @@ def process(name: str) -> None:
 
 
 # Enqueue in reverse priority order
-pq.enqueue(process, "batch job", priority=Priority.BATCH)      # 0
-pq.enqueue(process, "low priority", priority=Priority.LOW)     # 25
-pq.enqueue(process, "normal task", priority=Priority.NORMAL)   # 50
-pq.enqueue(process, "high priority", priority=Priority.HIGH)   # 75
-pq.enqueue(process, "CRITICAL!", priority=Priority.CRITICAL)   # 100
+pq.enqueue(process, "batch job", priority=Priority.BATCH)  # 0
+pq.enqueue(process, "low priority", priority=Priority.LOW)  # 25
+pq.enqueue(process, "normal task", priority=Priority.NORMAL)  # 50
+pq.enqueue(process, "high priority", priority=Priority.HIGH)  # 75
+pq.enqueue(process, "CRITICAL!", priority=Priority.CRITICAL)  # 100
 
 print(f"Enqueued {pq.pending_count()} tasks\n")
 
