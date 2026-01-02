@@ -41,3 +41,6 @@ htmlcov/
 # mypy / type checkers
 .mypy_cache/
 .ty/
+
+# Documentation
+site/

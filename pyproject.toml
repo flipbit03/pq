@@ -19,6 +19,12 @@ dependencies = [
     "sqlalchemy>=2.0.45",
 ]
 
+[project.optional-dependencies]
+docs = [
+    "mkdocs-material>=9.6",
+    "mkdocstrings[python]>=0.29",
+]
+
 [project.scripts]
 pq = "pq.cli:main"
 
