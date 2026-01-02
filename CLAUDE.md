@@ -83,18 +83,6 @@ Use **SQLAlchemy 2.0-style** syntax:
 - Use `session.scalars()` for single-column results
 - Use type annotations with `Mapped[]` for model attributes
 
-### Alembic Migrations
-
-Use **Alembic** for database migrations. Always run via `uv run`:
-
-```bash
-uv run alembic upgrade head          # Apply all migrations
-uv run alembic revision --autogenerate -m "description"  # Generate migration
-uv run alembic downgrade -1          # Rollback one migration
-```
-
-Migration files are time-sorted using timestamp prefixes (configured via `file_template` in `alembic.ini`).
-
 ## Code Conventions
 
 ### Pydantic
