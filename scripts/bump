@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Bump version, update pyproject.toml, commit, and tag."""
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+PYPROJECT = Path(__file__).parent.parent / "pyproject.toml"
+SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+
+def parse_version(version: str) -> tuple[int, int, int]:
+    """Parse and validate semver string, returns (major, minor, patch)."""
+    match = SEMVER_PATTERN.match(version)
+    if not match:
+        raise ValueError(f"Invalid semver: {version!r} (expected X.Y.Z)")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def get_current_version() -> str:
+    """Read current version from pyproject.toml."""
+    content = PYPROJECT.read_text()
+    match = re.search(r'^version\s*=\s*"([^"]+)"', content, re.MULTILINE)
+    if not match:
+        raise RuntimeError("Could not find version in pyproject.toml")
+    return match.group(1)
+
+
+def set_version(new_version: str) -> None:
+    """Update version in pyproject.toml."""
+    content = PYPROJECT.read_text()
+    new_content = re.sub(
+        r'^(version\s*=\s*)"[^"]+"',
+        f'\\1"{new_version}"',
+        content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    PYPROJECT.write_text(new_content)
+
+
+def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run a command and return the result."""
+    return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <version> [--push]", file=sys.stderr)
+        print(f"Example: {sys.argv[0]} 1.0.0", file=sys.stderr)
+        return 1
+
+    new_version = sys.argv[1]
+    push = "--push" in sys.argv
+
+    # Validate new version
+    try:
+        new_tuple = parse_version(new_version)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # Get and validate current version
+    try:
+        current_version = get_current_version()
+        current_tuple = parse_version(current_version)
+    except (RuntimeError, ValueError) as e:
+        print(f"Error reading current version: {e}", file=sys.stderr)
+        return 1
+
+    # Ensure new version is higher
+    if new_tuple <= current_tuple:
+        print(
+            f"Error: New version {new_version} must be higher than current {current_version}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Update pyproject.toml
+    set_version(new_version)
+    print(f"Updated pyproject.toml: {current_version} -> {new_version}")
+
+    # Commit
+    run(["git", "add", str(PYPROJECT)])
+    run(["git", "commit", "-m", f"Release {new_version}"])
+    print(f"Committed: Release {new_version}")
+
+    # Tag
+    run(["git", "tag", new_version])
+    print(f"Tagged: {new_version}")
+
+    # Push if requested
+    if push:
+        run(["git", "push"])
+        run(["git", "push", "--tags"])
+        print("Pushed to remote")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
