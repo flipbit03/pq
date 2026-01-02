@@ -11,33 +11,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Python 3.14
-        run: |
-          sudo add-apt-repository ppa:deadsnakes/ppa -y
-          sudo apt-get update
-          sudo apt-get install -y python3.14
-
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.14"
 
-      - name: Check linting
-        run: uv run ruff check .
-
-      - name: Check formatting
-        run: uv run ruff format --check .
+      - name: Check linting / formatting
+        run: uv run pre-commit run --all-files
 
   types:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Python 3.14
-        run: |
-          sudo add-apt-repository ppa:deadsnakes/ppa -y
-          sudo apt-get update
-          sudo apt-get install -y python3.14
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -66,12 +51,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Python 3.14
-        run: |
-          sudo add-apt-repository ppa:deadsnakes/ppa -y
-          sudo apt-get update
-          sudo apt-get install -y python3.14
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
