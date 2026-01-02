@@ -6,44 +6,11 @@ on:
       - "[0-9]+.[0-9]+.[0-9]+"
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd="pg_isready -U postgres"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=5
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install uv / python
-        uses: astral-sh/setup-uv@v7
-        with:
-          python-version: "3.14"
-
-      - name: Check linting / formatting
-        run: uv run pre-commit run --all-files
-
-      - name: Type check
-        run: uv run ty check
-
-      - name: Run tests
-        env:
-          PQ_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
-        run: uv run pytest
+  ci:
+    uses: ./.github/workflows/ci.yml
 
   build:
-    needs: test
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

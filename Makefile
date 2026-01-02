@@ -9,11 +9,10 @@ clean:
 cycle: clean dev
 
 lint:
-	uv run ruff check .
-	uv run ruff format --check .
+	uv run pre-commit run --all-files
 
 types:
-	uv run ty check
+	uv run ty check -q
 
 test:
 	uv run pytest
