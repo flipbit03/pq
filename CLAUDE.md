@@ -67,7 +67,7 @@ uv run ruff format .
 
 ## Testing
 
-Use **pytest** for all tests:
+Postgres must be running before tests (`make dev`). Use **pytest** for all tests:
 
 ```bash
 uv run pytest

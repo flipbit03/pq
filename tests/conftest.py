@@ -26,6 +26,7 @@ def pq(db_url: str) -> Generator[PQ, None, None]:
     client.clear_all()
     yield client
     client.clear_all()
+    client.close()
 
 
 @pytest.fixture

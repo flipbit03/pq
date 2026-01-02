@@ -107,6 +107,10 @@ def main() -> int:
         run(push_tags_cmd)
         print("Pushed to remote")
 
+        # Create GitHub release with auto-generated notes
+        run(["gh", "release", "create", new_version, "--generate-notes"])
+        print(f"Created GitHub release: {new_version}")
+
     return 0
 
 
