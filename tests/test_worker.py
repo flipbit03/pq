@@ -178,6 +178,32 @@ class TestRunWorkerOnce:
         # Should process in priority order: HIGH, NORMAL, LOW
         assert list(results) == [1, 2, 3]
 
+    def test_filters_by_priority(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Worker only processes tasks matching priority filter."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        # Enqueue tasks with different priorities
+        pq.enqueue(ordered_handler, n=1, priority=Priority.HIGH)
+        pq.enqueue(ordered_handler, n=2, priority=Priority.NORMAL)
+        pq.enqueue(ordered_handler, n=3, priority=Priority.LOW)
+
+        # Worker with HIGH-only filter
+        pq.run_worker_once(priorities={Priority.HIGH})
+        pq.run_worker_once(priorities={Priority.HIGH})  # Should find nothing
+
+        # Only HIGH priority task should be processed
+        assert list(results) == [1]
+        assert pq.pending_count() == 2  # NORMAL and LOW still pending
+
+        # Process remaining with no filter
+        pq.run_worker_once()
+        pq.run_worker_once()
+
+        assert list(results) == [1, 2, 3]
+
 
 class TestPeriodicTasks:
     """Tests for periodic task processing."""

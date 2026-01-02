@@ -14,7 +14,7 @@ Postgres-backed job queue for Python with fork-based worker isolation.
 ## Installation
 
 ```bash
-pip install pq
+uv add pq
 ```
 
 Requires PostgreSQL and Python 3.14+.
@@ -132,7 +132,25 @@ if pq.run_worker_once():
 
 # Timeout (kill tasks running longer than 5 minutes)
 pq.run_worker(max_runtime=300)
+
+# Dedicated worker for specific priorities
+from pq import Priority
+pq.run_worker(priorities={Priority.CRITICAL, Priority.HIGH})
 ```
+
+## Dedicated Priority Workers
+
+Run separate workers for different priority tiers to ensure high-priority tasks aren't blocked:
+
+```bash
+# Terminal 1: High-priority worker (CRITICAL + HIGH only)
+python -c "from myapp import pq; from pq import Priority; pq.run_worker(priorities={Priority.CRITICAL, Priority.HIGH})"
+
+# Terminal 2-3: General workers (all priorities)
+python -c "from myapp import pq; pq.run_worker()"
+```
+
+This ensures critical tasks get processed immediately even when the queue is busy.
 
 ## Task Management
 

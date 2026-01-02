@@ -25,9 +25,10 @@ from pq.registry import resolve_function_path
 from pq.serialization import deserialize
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Set
 
     from pq.client import PQ
+    from pq.priority import Priority
 
 # Default max runtime: 30 minutes
 DEFAULT_MAX_RUNTIME: float = 30 * 60
@@ -198,6 +199,7 @@ def run_worker(
     *,
     poll_interval: float = 1.0,
     max_runtime: float = DEFAULT_MAX_RUNTIME,
+    priorities: Set[Priority] | None = None,
 ) -> None:
     """Run the worker loop indefinitely.
 
@@ -207,17 +209,28 @@ def run_worker(
         pq: PQ client instance.
         poll_interval: Seconds to sleep between polls when idle.
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
+        priorities: If set, only process tasks with these priority levels.
+            Use this to dedicate workers to specific priority tiers.
     """
-    logger.info("Starting PQ worker (fork isolation enabled)...")
+    if priorities:
+        priority_names = ", ".join(p.name for p in sorted(priorities, reverse=True))
+        logger.info(f"Starting PQ worker (priorities: {priority_names})...")
+    else:
+        logger.info("Starting PQ worker (fork isolation enabled)...")
     try:
         while True:
-            if not run_worker_once(pq, max_runtime=max_runtime):
+            if not run_worker_once(pq, max_runtime=max_runtime, priorities=priorities):
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Worker stopped.")
 
 
-def run_worker_once(pq: PQ, *, max_runtime: float = DEFAULT_MAX_RUNTIME) -> bool:
+def run_worker_once(
+    pq: PQ,
+    *,
+    max_runtime: float = DEFAULT_MAX_RUNTIME,
+    priorities: Set[Priority] | None = None,
+) -> bool:
     """Process a single task if available.
 
     Checks one-off tasks first, then periodic tasks.
@@ -225,27 +238,34 @@ def run_worker_once(pq: PQ, *, max_runtime: float = DEFAULT_MAX_RUNTIME) -> bool
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
+        priorities: If set, only process tasks with these priority levels.
 
     Returns:
         True if a task was processed, False if queue was empty.
     """
     # Try one-off task first
-    if _process_one_off_task(pq, max_runtime=max_runtime):
+    if _process_one_off_task(pq, max_runtime=max_runtime, priorities=priorities):
         return True
 
     # Try periodic task
-    if _process_periodic_task(pq, max_runtime=max_runtime):
+    if _process_periodic_task(pq, max_runtime=max_runtime, priorities=priorities):
         return True
 
     return False
 
 
-def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
+def _process_one_off_task(
+    pq: PQ,
+    *,
+    max_runtime: float,
+    priorities: Set[Priority] | None = None,
+) -> bool:
     """Claim and process a one-off task.
 
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time in seconds.
+        priorities: If set, only process tasks with these priority levels.
 
     Returns:
         True if a task was processed.
@@ -258,7 +278,11 @@ def _process_one_off_task(pq: PQ, *, max_runtime: float) -> bool:
             select(Task)
             .where(Task.status == TaskStatus.PENDING)
             .where(Task.run_at <= func.now())
-            .order_by(Task.priority.desc(), Task.run_at)
+        )
+        if priorities:
+            stmt = stmt.where(Task.priority.in_([p.value for p in priorities]))
+        stmt = (
+            stmt.order_by(Task.priority.desc(), Task.run_at)
             .with_for_update(skip_locked=True)
             .limit(1)
         )
@@ -363,12 +387,18 @@ def _calculate_next_run_cron(cron_expr: str) -> datetime:
     return cron.get_next(datetime)
 
 
-def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
+def _process_periodic_task(
+    pq: PQ,
+    *,
+    max_runtime: float,
+    priorities: Set[Priority] | None = None,
+) -> bool:
     """Claim and process a periodic task.
 
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time in seconds.
+        priorities: If set, only process tasks with these priority levels.
 
     Returns:
         True if a task was processed.
@@ -379,10 +409,11 @@ def _process_periodic_task(pq: PQ, *, max_runtime: float) -> bool:
 
     try:
         # Claim highest priority due periodic task with FOR UPDATE SKIP LOCKED
+        stmt = select(Periodic).where(Periodic.next_run <= func.now())
+        if priorities:
+            stmt = stmt.where(Periodic.priority.in_([p.value for p in priorities]))
         stmt = (
-            select(Periodic)
-            .where(Periodic.next_run <= func.now())
-            .order_by(Periodic.priority.desc(), Periodic.next_run)
+            stmt.order_by(Periodic.priority.desc(), Periodic.next_run)
             .with_for_update(skip_locked=True)
             .limit(1)
         )

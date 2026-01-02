@@ -1,6 +1,6 @@
 """PQ client - main interface for task queue."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Set
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -289,7 +289,11 @@ class PQ:
             return result.rowcount
 
     def run_worker(
-        self, *, poll_interval: float = 1.0, max_runtime: float = 30 * 60
+        self,
+        *,
+        poll_interval: float = 1.0,
+        max_runtime: float = 30 * 60,
+        priorities: Set[Priority] | None = None,
     ) -> None:
         """Run the worker loop (blocking).
 
@@ -298,22 +302,35 @@ class PQ:
         Args:
             poll_interval: Seconds to sleep between polls when idle.
             max_runtime: Maximum execution time per task in seconds. Default: 30 min.
+            priorities: If set, only process tasks with these priority levels.
+                Use this to dedicate workers to specific priority tiers.
         """
         from pq.worker import run_worker
 
-        run_worker(self, poll_interval=poll_interval, max_runtime=max_runtime)
+        run_worker(
+            self,
+            poll_interval=poll_interval,
+            max_runtime=max_runtime,
+            priorities=priorities,
+        )
 
-    def run_worker_once(self, *, max_runtime: float = 30 * 60) -> bool:
+    def run_worker_once(
+        self,
+        *,
+        max_runtime: float = 30 * 60,
+        priorities: Set[Priority] | None = None,
+    ) -> bool:
         """Process a single task if available.
 
         Each task executes in a forked child process for memory isolation.
 
         Args:
             max_runtime: Maximum execution time per task in seconds. Default: 30 min.
+            priorities: If set, only process tasks with these priority levels.
 
         Returns:
             True if a task was processed, False if queue was empty.
         """
         from pq.worker import run_worker_once
 
-        return run_worker_once(self, max_runtime=max_runtime)
+        return run_worker_once(self, max_runtime=max_runtime, priorities=priorities)
