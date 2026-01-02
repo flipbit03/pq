@@ -3,7 +3,8 @@
 from collections.abc import Callable, Set
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 from croniter import croniter
 from croniter.croniter import CroniterBadCronError
@@ -42,6 +43,27 @@ class PQ:
             raise
         finally:
             session.close()
+
+    def close(self) -> None:
+        """Close all database connections and dispose the engine.
+
+        This closes all connections in the connection pool. After calling
+        this method, the PQ instance should not be used.
+        """
+        self._engine.dispose()
+
+    def __enter__(self) -> Self:
+        """Enter context manager."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit context manager and close connections."""
+        self.close()
 
     def create_tables(self) -> None:
         """Create all tables (for testing)."""
