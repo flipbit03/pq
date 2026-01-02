@@ -14,10 +14,12 @@ Postgres-backed job queue for Python with fork-based worker isolation.
 ## Installation
 
 ```bash
-uv add pq
+pip install python-pq
+# or
+uv add python-pq
 ```
 
-Requires PostgreSQL and Python 3.14+.
+Requires PostgreSQL and Python 3.13+.
 
 ## Quick Start
 

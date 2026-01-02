@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "ricwo", email = "r@cogram.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.13,<3.15"
 dependencies = [
     "alembic>=1.17.2",
     "click>=8.3.1",
