@@ -8,6 +8,7 @@ from pathlib import Path
 
 PYPROJECT = Path(__file__).parent.parent / "pyproject.toml"
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+BUMP_TYPES = {"patch", "minor", "major"}
 
 
 def parse_version(version: str) -> tuple[int, int, int]:
@@ -16,6 +17,17 @@ def parse_version(version: str) -> tuple[int, int, int]:
     if not match:
         raise ValueError(f"Invalid semver: {version!r} (expected X.Y.Z)")
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def increment_version(current: tuple[int, int, int], bump_type: str) -> str:
+    """Increment version based on bump type."""
+    major, minor, patch = current
+    if bump_type == "patch":
+        return f"{major}.{minor}.{patch + 1}"
+    elif bump_type == "minor":
+        return f"{major}.{minor + 1}.0"
+    else:  # major
+        return f"{major + 1}.0.0"
 
 
 def get_current_version() -> str:
@@ -47,28 +59,40 @@ def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <version> [--push] [--force]", file=sys.stderr)
-        print(f"Example: {sys.argv[0]} 1.0.0", file=sys.stderr)
+        print(
+            f"Usage: {sys.argv[0]} <patch|minor|major|X.Y.Z> [--push] [--force]",
+            file=sys.stderr,
+        )
+        print("Examples:", file=sys.stderr)
+        print(f"  {sys.argv[0]} patch        # 0.2.2 -> 0.2.3", file=sys.stderr)
+        print(f"  {sys.argv[0]} minor        # 0.2.2 -> 0.3.0", file=sys.stderr)
+        print(f"  {sys.argv[0]} major        # 0.2.2 -> 1.0.0", file=sys.stderr)
+        print(f"  {sys.argv[0]} 1.0.0        # explicit version", file=sys.stderr)
         return 1
 
-    new_version = sys.argv[1]
+    version_arg = sys.argv[1]
     push = "--push" in sys.argv
     force = "--force" in sys.argv
 
-    # Validate new version
-    try:
-        new_tuple = parse_version(new_version)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
-    # Get and validate current version
+    # Get current version first (needed for both bump types and validation)
     try:
         current_version = get_current_version()
         current_tuple = parse_version(current_version)
     except (RuntimeError, ValueError) as e:
         print(f"Error reading current version: {e}", file=sys.stderr)
         return 1
+
+    # Determine new version
+    if version_arg in BUMP_TYPES:
+        new_version = increment_version(current_tuple, version_arg)
+        new_tuple = parse_version(new_version)
+    else:
+        new_version = version_arg
+        try:
+            new_tuple = parse_version(new_version)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
     # Ensure new version is higher (unless --force)
     if new_tuple <= current_tuple and not force:
@@ -91,10 +115,12 @@ def main() -> int:
     else:
         print("No changes to commit")
 
-    # Tag (force if requested)
-    tag_cmd = (
-        ["git", "tag", "-f", new_version] if force else ["git", "tag", new_version]
-    )
+    # Tag with annotation (force if requested)
+    tag_msg = f"Release {new_version}"
+    if force:
+        tag_cmd = ["git", "tag", "-a", "-f", new_version, "-m", tag_msg]
+    else:
+        tag_cmd = ["git", "tag", "-a", new_version, "-m", tag_msg]
     run(tag_cmd)
     print(f"Tagged: {new_version}")
 
@@ -105,11 +131,7 @@ def main() -> int:
             ["git", "push", "--tags", "--force"] if force else ["git", "push", "--tags"]
         )
         run(push_tags_cmd)
-        print("Pushed to remote")
-
-        # Create GitHub release with auto-generated notes
-        run(["gh", "release", "create", new_version, "--generate-notes"])
-        print(f"Created GitHub release: {new_version}")
+        print("Pushed to remote (CI will create GitHub release and publish to PyPI)")
 
     return 0
 

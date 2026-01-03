@@ -1,61 +1,63 @@
 # Release Process
 
+## Quick Release
+
+```bash
+make release-patch   # 0.2.2 -> 0.2.3 (bug fixes)
+make release-minor   # 0.2.2 -> 0.3.0 (new features)
+make release-major   # 0.2.2 -> 1.0.0 (breaking changes)
+```
+
+This bumps the version, commits, tags, and pushes. CI handles the rest.
+
 ## Prerequisites
 
 - Clean working tree (`git status` shows no changes)
 - All tests passing (`uv run pytest`)
 - On `main` branch
 
-## Release Steps
+## What Happens
 
-1. **Bump version and create tag:**
+1. Version in `pyproject.toml` is updated
+2. Commit created with message "Release X.Y.Z"
+3. Annotated git tag created
+4. Pushed to remote
+5. CI automatically:
+   - Runs linting, type checking, and tests
+   - Builds the package
+   - Creates GitHub Release with artifacts
+   - Publishes to PyPI
 
-   ```bash
-   ./scripts/bump <version>
-   ```
+## Manual Usage
 
-   This will:
-   - Validate semver format (X.Y.Z)
-   - Ensure new version > current version
-   - Update `pyproject.toml`
-   - Commit with message "Release X.Y.Z"
-   - Create git tag `X.Y.Z`
+For explicit version control:
 
-2. **Push to trigger release:**
-
-   ```bash
-   git push && git push --tags
-   ```
-
-   Or do it in one step:
-
-   ```bash
-   ./scripts/bump <version> --push
-   ```
-
-3. **GitHub Actions will automatically:**
-   - Run linting, type checking, and tests
-   - Build the package
-   - Create a GitHub Release with artifacts
-   - Publish to PyPI (via trusted publishing)
+```bash
+./scripts/bump patch              # auto-increment patch
+./scripts/bump minor              # auto-increment minor
+./scripts/bump major              # auto-increment major
+./scripts/bump 1.0.0              # explicit version
+./scripts/bump 1.0.0 --push       # bump and push
+./scripts/bump 1.0.0 --force      # override version check
+```
 
 ## Version Format
 
-Use semantic versioning without a `v` prefix:
+Semantic versioning without `v` prefix:
 
-- `1.0.0` - Major release
-- `1.1.0` - Minor release (new features)
-- `1.1.1` - Patch release (bug fixes)
+- `1.0.0` - Major (breaking changes)
+- `1.1.0` - Minor (new features)
+- `1.1.1` - Patch (bug fixes)
 
 ## PyPI
 
-The package is published as `python-pq` on PyPI:
+Published as `python-pq`:
 
 ```bash
 pip install python-pq
 ```
 
-Import remains `pq`:
+Import as `pq`:
 
 ```python
 from pq import PQ
