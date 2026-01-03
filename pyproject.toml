@@ -20,8 +20,8 @@ dependencies = [
 
 [project.optional-dependencies]
 docs = [
-    "mkdocs-material>=9.6",
-    "mkdocstrings[python]>=0.29",
+    "mkdocs-material>=9.7.1",
+    "mkdocstrings[python]>=1.0.0",
 ]
 
 [project.scripts]
