@@ -1,13 +1,27 @@
 # Database
 
+## Setup
+
+Run migrations once at application startup:
+
+```python
+from pq import PQ
+
+pq = PQ("postgresql://localhost/mydb")
+pq.run_db_migrations()
+```
+
+This is safe to call multiple times - only pending migrations are applied.
+
 ## Tables
 
-pq creates two tables with the `pq_` prefix:
+pq creates three tables with the `pq_` prefix:
 
-- `pq_tasks` - One-off tasks
-- `pq_periodic` - Periodic task schedules
-
-Tables are created with `pq.create_tables()`.
+| Table | Description |
+|-------|-------------|
+| `pq_tasks` | One-off tasks |
+| `pq_periodic` | Periodic task schedules |
+| `pq_schema_version` | Alembic migration tracking |
 
 ## Alembic Integration
 
@@ -32,4 +46,4 @@ context.configure(
 )
 ```
 
-This prevents Alembic from generating migrations for pq tables, which are managed by `pq.create_tables()`.
+This prevents Alembic from generating migrations for pq tables, which are managed by `pq.run_db_migrations()`.

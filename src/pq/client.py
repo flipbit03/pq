@@ -69,11 +69,16 @@ class PQ:
         """Exit context manager and close connections."""
         self.close()
 
-    def upgrade(self, revision: str = "head") -> None:
-        """Run database migrations to the specified revision.
+    def run_db_migrations(self) -> None:
+        """Run database migrations to latest version.
 
-        Args:
-            revision: Target revision. Defaults to "head" (latest).
+        Call this once at application startup before using the queue.
+        Uses Alembic to apply any pending migrations. Safe to call
+        multiple times - only pending migrations are applied.
+
+        Example:
+            pq = PQ("postgresql://localhost/mydb")
+            pq.run_db_migrations()
         """
         # Lazy import to avoid fork issues on macOS
         from alembic import command
@@ -81,17 +86,19 @@ class PQ:
 
         alembic_cfg = Config(str(_ALEMBIC_INI))
         alembic_cfg.set_main_option("sqlalchemy.url", str(self._engine.url))
-        command.upgrade(alembic_cfg, revision)
+        command.upgrade(alembic_cfg, "head")
 
     def create_tables(self) -> None:
-        """Create all tables (for testing).
+        """Create all tables directly (for testing only).
 
-        For production, use upgrade() to run migrations instead.
+        For production, use run_db_migrations() instead. This method
+        bypasses Alembic and creates tables directly via SQLAlchemy,
+        which doesn't track schema versions.
         """
         Base.metadata.create_all(self._engine)
 
     def drop_tables(self) -> None:
-        """Drop all tables (for testing)."""
+        """Drop all tables (for testing only)."""
         Base.metadata.drop_all(self._engine)
 
     def clear_all(self) -> None:
