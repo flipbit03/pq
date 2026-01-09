@@ -45,6 +45,9 @@ class Task(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    client_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, unique=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
@@ -76,6 +79,9 @@ class Periodic(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    client_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, unique=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)

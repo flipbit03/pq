@@ -79,6 +79,29 @@ pq.enqueue(fetch_data, url="https://api.example.com")
 pq.run_worker_once()
 ```
 
+## Client IDs
+
+Use `client_id` for custom identifiers to link tasks to your domain objects.
+
+```python
+from pq import PQ
+
+pq = PQ("postgresql://localhost/mydb")
+
+def process_order(order_id: int) -> None:
+    print(f"Processing order {order_id}")
+
+# Enqueue with a client-provided ID
+pq.enqueue(process_order, order_id=123, client_id="order-123")
+
+# Look up by client_id
+task = pq.get_task_by_client_id("order-123")
+print(f"Task status: {task.status}")
+
+# Duplicate client_id raises IntegrityError
+# pq.enqueue(process_order, order_id=456, client_id="order-123")  # Error!
+```
+
 ## Error Handling
 
 [`examples/error_handling.py`](https://github.com/ricwo/pq/blob/main/examples/error_handling.py) - Failures and cleanup.

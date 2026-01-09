@@ -17,6 +17,8 @@
         - pending_count
         - periodic_count
         - get_task
+        - get_task_by_client_id
+        - get_periodic_by_client_id
         - list_failed
         - list_completed
         - clear_failed

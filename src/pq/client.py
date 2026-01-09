@@ -113,6 +113,7 @@ class PQ:
         *args: Any,
         run_at: datetime | None = None,
         priority: Priority = Priority.NORMAL,
+        client_id: str | None = None,
         **kwargs: Any,
     ) -> int:
         """Enqueue a one-off task.
@@ -122,6 +123,7 @@ class PQ:
             *args: Positional arguments to pass to the handler.
             run_at: When to run the task. Defaults to now.
             priority: Task priority. Higher = higher priority. Defaults to NORMAL.
+            client_id: Optional client-provided identifier. Must be unique if provided.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
@@ -129,6 +131,7 @@ class PQ:
 
         Raises:
             ValueError: If task is a lambda, closure, or cannot be imported.
+            IntegrityError: If client_id already exists.
         """
         name = get_function_path(task)
         payload = serialize(args, kwargs)
@@ -136,7 +139,13 @@ class PQ:
         if run_at is None:
             run_at = datetime.now(UTC)
 
-        task_obj = Task(name=name, payload=payload, run_at=run_at, priority=priority)
+        task_obj = Task(
+            name=name,
+            payload=payload,
+            run_at=run_at,
+            priority=priority,
+            client_id=client_id,
+        )
 
         with self.session() as session:
             session.add(task_obj)
@@ -150,6 +159,7 @@ class PQ:
         run_every: timedelta | None = None,
         cron: str | croniter | None = None,
         priority: Priority = Priority.NORMAL,
+        client_id: str | None = None,
         **kwargs: Any,
     ) -> int:
         """Schedule a periodic task.
@@ -163,6 +173,7 @@ class PQ:
             run_every: Interval between executions (e.g., timedelta(hours=1)).
             cron: Cron expression string (e.g., "0 9 * * 1") or croniter object.
             priority: Task priority. Higher = higher priority. Defaults to NORMAL.
+            client_id: Optional client-provided identifier. Must be unique if provided.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
@@ -172,6 +183,7 @@ class PQ:
             ValueError: If neither run_every nor cron is provided, or if both are.
             ValueError: If cron expression is invalid.
             ValueError: If task is a lambda, closure, or cannot be imported.
+            IntegrityError: If client_id already exists.
         """
         if run_every is None and cron is None:
             raise ValueError("Either run_every or cron must be provided")
@@ -213,6 +225,7 @@ class PQ:
                     run_every=run_every,
                     cron=cron_expr,
                     next_run=next_run,
+                    client_id=client_id,
                 )
                 .on_conflict_do_update(
                     index_elements=["name"],
@@ -288,6 +301,38 @@ class PQ:
             if task:
                 session.expunge(task)
             return task
+
+    def get_task_by_client_id(self, client_id: str) -> Task | None:
+        """Get a task by client_id.
+
+        Args:
+            client_id: Client-provided identifier.
+
+        Returns:
+            Task object or None if not found.
+        """
+        with self.session() as session:
+            stmt = select(Task).where(Task.client_id == client_id)
+            task = session.execute(stmt).scalar_one_or_none()
+            if task:
+                session.expunge(task)
+            return task
+
+    def get_periodic_by_client_id(self, client_id: str) -> Periodic | None:
+        """Get a periodic task by client_id.
+
+        Args:
+            client_id: Client-provided identifier.
+
+        Returns:
+            Periodic object or None if not found.
+        """
+        with self.session() as session:
+            stmt = select(Periodic).where(Periodic.client_id == client_id)
+            periodic = session.execute(stmt).scalar_one_or_none()
+            if periodic:
+                session.expunge(periodic)
+            return periodic
 
     def list_failed(self, limit: int = 100) -> list[Task]:
         """List failed tasks.

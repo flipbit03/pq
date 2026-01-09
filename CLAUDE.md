@@ -97,3 +97,12 @@ Use **Pydantic** models wherever possible:
 - `pq/` - Main package
 - `migrations/` - Alembic database migrations
 - `main.py` - Entry point
+
+### Migration Column Ordering
+
+When creating migrations, order columns as follows:
+1. Primary key (`id`)
+2. Foreign keys
+3. Business/data columns (including `client_id`)
+4. `created_at`
+5. `modified_at` / other timestamps
