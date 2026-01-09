@@ -1,9 +1,9 @@
 """PQ client - main interface for task queue."""
 
+import importlib.resources
 from collections.abc import Callable, Set
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
@@ -18,9 +18,6 @@ from pq.models import Base, Periodic, Task, TaskStatus
 from pq.priority import Priority
 from pq.registry import get_function_path
 from pq.serialization import serialize
-
-# Path to alembic.ini relative to this module
-_ALEMBIC_INI = Path(__file__).parent.parent.parent / "alembic.ini"
 
 
 class PQ:
@@ -84,7 +81,12 @@ class PQ:
         from alembic import command
         from alembic.config import Config
 
-        alembic_cfg = Config(str(_ALEMBIC_INI))
+        # Get migrations directory from within the installed package
+        migrations_pkg = importlib.resources.files("pq.migrations")
+        migrations_dir = str(migrations_pkg)
+
+        alembic_cfg = Config()
+        alembic_cfg.set_main_option("script_location", migrations_dir)
         alembic_cfg.set_main_option("sqlalchemy.url", str(self._engine.url))
         command.upgrade(alembic_cfg, "head")
 
