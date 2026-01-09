@@ -3,6 +3,7 @@
 from collections.abc import Callable, Set
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
@@ -17,6 +18,9 @@ from pq.models import Base, Periodic, Task, TaskStatus
 from pq.priority import Priority
 from pq.registry import get_function_path
 from pq.serialization import serialize
+
+# Path to alembic.ini relative to this module
+_ALEMBIC_INI = Path(__file__).parent.parent.parent / "alembic.ini"
 
 
 class PQ:
@@ -65,8 +69,25 @@ class PQ:
         """Exit context manager and close connections."""
         self.close()
 
+    def upgrade(self, revision: str = "head") -> None:
+        """Run database migrations to the specified revision.
+
+        Args:
+            revision: Target revision. Defaults to "head" (latest).
+        """
+        # Lazy import to avoid fork issues on macOS
+        from alembic import command
+        from alembic.config import Config
+
+        alembic_cfg = Config(str(_ALEMBIC_INI))
+        alembic_cfg.set_main_option("sqlalchemy.url", str(self._engine.url))
+        command.upgrade(alembic_cfg, revision)
+
     def create_tables(self) -> None:
-        """Create all tables (for testing)."""
+        """Create all tables (for testing).
+
+        For production, use upgrade() to run migrations instead.
+        """
         Base.metadata.create_all(self._engine)
 
     def drop_tables(self) -> None:
