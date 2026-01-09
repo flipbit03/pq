@@ -54,8 +54,16 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    # Support both ini file config and programmatic config
+    config_section = config.get_section(config.config_ini_section, {})
+    url = config.get_main_option("sqlalchemy.url")
+
+    if url and not config_section.get("sqlalchemy.url"):
+        # URL was set programmatically, add it to config section
+        config_section["sqlalchemy.url"] = url
+
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        config_section,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )

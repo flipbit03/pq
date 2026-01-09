@@ -1,7 +1,10 @@
-.PHONY: dev clean cycle lint types test release-patch release-minor release-major
+.PHONY: dev down clean cycle lint types test release-patch release-minor release-major
 
 dev:
 	docker compose up -d --wait
+
+down:
+	docker compose down -v
 
 clean:
 	docker compose down -v
