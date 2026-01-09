@@ -1,5 +1,6 @@
 {
   "scripts": {
+    "run": "make dev",
     "archive": "make down"
   },
   "runScriptMode": "nonconcurrent"
