@@ -7,6 +7,7 @@
       show_source: false
       members:
         - __init__
+        - run_db_migrations
         - enqueue
         - schedule
         - unschedule
@@ -21,8 +22,6 @@
         - clear_failed
         - clear_completed
         - clear_all
-        - create_tables
-        - drop_tables
 
 ## Priority
 

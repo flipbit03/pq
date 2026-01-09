@@ -25,7 +25,7 @@ Requires PostgreSQL and Python 3.13+.
 from pq import PQ
 
 pq = PQ("postgresql://localhost/mydb")
-pq.create_tables()
+pq.run_db_migrations()  # Creates/updates tables
 
 def send_email(to: str, subject: str) -> None:
     print(f"Sending to {to}: {subject}")
