@@ -3,6 +3,7 @@
 import pytest
 from croniter import croniter
 from datetime import UTC, datetime, timedelta
+from sqlalchemy.exc import IntegrityError
 
 from pq.client import PQ
 from pq.models import Periodic, Task
@@ -199,3 +200,87 @@ class TestUnschedule:
         """Unschedule returns False for nonexistent function."""
         result = pq.unschedule(dummy_handler)
         assert result is False
+
+
+class TestClientId:
+    """Tests for client_id functionality."""
+
+    def test_enqueue_with_client_id(self, pq: PQ) -> None:
+        """Enqueue stores client_id correctly."""
+        task_id = pq.enqueue(dummy_handler, client_id="my-task-1")
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.client_id == "my-task-1"
+
+    def test_enqueue_duplicate_client_id_raises(self, pq: PQ) -> None:
+        """Enqueue with duplicate client_id raises IntegrityError."""
+        pq.enqueue(dummy_handler, client_id="unique-id")
+
+        with pytest.raises(IntegrityError):
+            pq.enqueue(dummy_handler, client_id="unique-id")
+
+    def test_enqueue_without_client_id(self, pq: PQ) -> None:
+        """Enqueue without client_id sets it to None."""
+        task_id = pq.enqueue(dummy_handler)
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.client_id is None
+
+    def test_schedule_with_client_id(self, pq: PQ) -> None:
+        """Schedule stores client_id correctly."""
+        pq.schedule(
+            cleanup_handler, run_every=timedelta(hours=1), client_id="periodic-1"
+        )
+
+        periodic = pq.get_periodic_by_client_id("periodic-1")
+        assert periodic is not None
+        assert periodic.client_id == "periodic-1"
+
+    def test_schedule_upsert_preserves_client_id(self, pq: PQ) -> None:
+        """Schedule upsert does not overwrite client_id."""
+        pq.schedule(
+            cleanup_handler, run_every=timedelta(hours=1), client_id="original-id"
+        )
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=2))
+
+        periodic = pq.get_periodic_by_client_id("original-id")
+        assert periodic is not None
+        assert periodic.run_every == timedelta(hours=2)
+
+    def test_get_task_by_client_id(self, pq: PQ) -> None:
+        """get_task_by_client_id returns correct task."""
+        task_id = pq.enqueue(dummy_handler, client_id="lookup-test")
+
+        task = pq.get_task_by_client_id("lookup-test")
+        assert task is not None
+        assert task.id == task_id
+
+    def test_get_task_by_client_id_not_found(self, pq: PQ) -> None:
+        """get_task_by_client_id returns None for non-existent client_id."""
+        task = pq.get_task_by_client_id("does-not-exist")
+        assert task is None
+
+    def test_get_periodic_by_client_id(self, pq: PQ) -> None:
+        """get_periodic_by_client_id returns correct periodic."""
+        periodic_id = pq.schedule(
+            cleanup_handler, run_every=timedelta(hours=1), client_id="periodic-lookup"
+        )
+
+        periodic = pq.get_periodic_by_client_id("periodic-lookup")
+        assert periodic is not None
+        assert periodic.id == periodic_id
+
+    def test_get_periodic_by_client_id_not_found(self, pq: PQ) -> None:
+        """get_periodic_by_client_id returns None for non-existent client_id."""
+        periodic = pq.get_periodic_by_client_id("does-not-exist")
+        assert periodic is None
+
+    def test_multiple_tasks_null_client_id(self, pq: PQ) -> None:
+        """Multiple tasks with null client_id are allowed."""
+        task_id_1 = pq.enqueue(dummy_handler)
+        task_id_2 = pq.enqueue(dummy_handler)
+
+        assert task_id_1 != task_id_2
+        assert pq.pending_count() == 2
