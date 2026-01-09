@@ -87,7 +87,9 @@ class PQ:
 
         alembic_cfg = Config()
         alembic_cfg.set_main_option("script_location", migrations_dir)
-        alembic_cfg.set_main_option("sqlalchemy.url", str(self._engine.url))
+        alembic_cfg.set_main_option(
+            "sqlalchemy.url", self._engine.url.render_as_string(hide_password=False)
+        )
         command.upgrade(alembic_cfg, "head")
 
     def create_tables(self) -> None:
