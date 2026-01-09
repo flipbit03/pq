@@ -29,7 +29,13 @@ class PQ:
         Args:
             database_url: PostgreSQL connection string.
         """
-        self._engine: Engine = create_engine(database_url)
+        self._engine: Engine = create_engine(
+            database_url,
+            pool_size=5,
+            max_overflow=10,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        )
         self._session_factory = sessionmaker(bind=self._engine)
 
     @contextmanager

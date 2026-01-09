@@ -316,105 +316,86 @@ def _process_one_off_task(
     Returns:
         True if a task was processed.
     """
-    session = pq._session_factory()
-    task = None
+    # Phase 1: Claim task
     try:
-        # Claim highest priority pending task with FOR UPDATE SKIP LOCKED
-        stmt = (
-            select(Task)
-            .where(Task.status == TaskStatus.PENDING)
-            .where(Task.run_at <= func.now())
-        )
-        if priorities:
-            stmt = stmt.where(Task.priority.in_([p.value for p in priorities]))
-        stmt = (
-            stmt.order_by(Task.priority.desc(), Task.run_at)
-            .with_for_update(skip_locked=True)
-            .limit(1)
-        )
-        task = session.execute(stmt).scalar_one_or_none()
+        with pq.session() as session:
+            # Claim highest priority pending task with FOR UPDATE SKIP LOCKED
+            stmt = (
+                select(Task)
+                .where(Task.status == TaskStatus.PENDING)
+                .where(Task.run_at <= func.now())
+            )
+            if priorities:
+                stmt = stmt.where(Task.priority.in_([p.value for p in priorities]))
+            stmt = (
+                stmt.order_by(Task.priority.desc(), Task.run_at)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            task = session.execute(stmt).scalar_one_or_none()
 
-        if task is None:
-            return False
+            if task is None:
+                return False
 
-        # Mark as running
-        task.status = TaskStatus.RUNNING
-        task.started_at = datetime.now(UTC)
-        task.attempts += 1
-        session.commit()
+            # Mark as running
+            task.status = TaskStatus.RUNNING
+            task.started_at = datetime.now(UTC)
+            task.attempts += 1
 
-        # Get task data for execution
-        name = task.name
-        payload = task.payload
-        task_id = task.id
+            # Get task data for execution (before session closes)
+            name = task.name
+            payload = task.payload
+            task_id = task.id
 
     except Exception as e:
-        session.rollback()
         logger.error(f"Error claiming task: {e}")
         return False
-    finally:
-        session.close()
 
-    # Execute handler in forked process
-    session = pq._session_factory()
+    # Phase 2: Execute handler in forked process
     start = time.perf_counter()
+    status = TaskStatus.COMPLETED
+    error_msg: str | None = None
+
     try:
         handler = resolve_function_path(name)
         args, kwargs = deserialize(payload)
         _execute_in_fork(handler, args, kwargs, max_runtime=max_runtime)
-        elapsed = time.perf_counter() - start
-
-        # Mark as completed
-        task = session.get(Task, task_id)
-        if task:
-            task.status = TaskStatus.COMPLETED
-            task.completed_at = datetime.now(UTC)
-            session.commit()
-
-        logger.debug(f"Task '{name}' completed in {elapsed:.3f} s")
 
     except TaskTimeoutError:
-        elapsed = time.perf_counter() - start
-        task = session.get(Task, task_id)
-        if task:
-            task.status = TaskStatus.FAILED
-            task.completed_at = datetime.now(UTC)
-            task.error = f"Timed out after {elapsed:.3f} s"
-            session.commit()
-        logger.error(f"Task '{name}' timed out after {elapsed:.3f} s")
+        status = TaskStatus.FAILED
+        error_msg = f"Timed out after {time.perf_counter() - start:.3f} s"
 
     except TaskOOMError as e:
-        elapsed = time.perf_counter() - start
-        task = session.get(Task, task_id)
-        if task:
-            task.status = TaskStatus.FAILED
-            task.completed_at = datetime.now(UTC)
-            task.error = str(e)
-            session.commit()
-        logger.error(f"Task '{name}' OOM after {elapsed:.3f} s: {e}")
+        status = TaskStatus.FAILED
+        error_msg = str(e)
 
     except TaskKilledError as e:
-        elapsed = time.perf_counter() - start
-        task = session.get(Task, task_id)
-        if task:
-            task.status = TaskStatus.FAILED
-            task.completed_at = datetime.now(UTC)
-            task.error = str(e)
-            session.commit()
-        logger.error(f"Task '{name}' killed after {elapsed:.3f} s: {e}")
+        status = TaskStatus.FAILED
+        error_msg = str(e)
 
     except Exception as e:
-        elapsed = time.perf_counter() - start
-        task = session.get(Task, task_id)
-        if task:
-            task.status = TaskStatus.FAILED
-            task.completed_at = datetime.now(UTC)
-            task.error = str(e)
-            session.commit()
-        logger.error(f"Task '{name}' failed after {elapsed:.3f} s: {e}")
+        status = TaskStatus.FAILED
+        error_msg = str(e)
 
-    finally:
-        session.close()
+    elapsed = time.perf_counter() - start
+
+    # Phase 3: Update task status
+    try:
+        with pq.session() as session:
+            task = session.get(Task, task_id)
+            if task:
+                task.status = status
+                task.completed_at = datetime.now(UTC)
+                if error_msg:
+                    task.error = error_msg
+    except Exception as e:
+        logger.error(f"Error updating task status: {e}")
+
+    # Log result
+    if status == TaskStatus.COMPLETED:
+        logger.debug(f"Task '{name}' completed in {elapsed:.3f} s")
+    else:
+        logger.error(f"Task '{name}' failed after {elapsed:.3f} s: {error_msg}")
 
     return True
 
@@ -449,70 +430,61 @@ def _process_periodic_task(
     Returns:
         True if a task was processed.
     """
-    session = pq._session_factory()
-    name = None
-    payload = None
-
+    # Phase 1: Claim and advance schedule
     try:
-        # Claim highest priority due periodic task with FOR UPDATE SKIP LOCKED
-        stmt = select(Periodic).where(Periodic.next_run <= func.now())
-        if priorities:
-            stmt = stmt.where(Periodic.priority.in_([p.value for p in priorities]))
-        stmt = (
-            stmt.order_by(Periodic.priority.desc(), Periodic.next_run)
-            .with_for_update(skip_locked=True)
-            .limit(1)
-        )
-        periodic = session.execute(stmt).scalar_one_or_none()
+        with pq.session() as session:
+            # Claim highest priority due periodic task with FOR UPDATE SKIP LOCKED
+            stmt = select(Periodic).where(Periodic.next_run <= func.now())
+            if priorities:
+                stmt = stmt.where(Periodic.priority.in_([p.value for p in priorities]))
+            stmt = (
+                stmt.order_by(Periodic.priority.desc(), Periodic.next_run)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            periodic = session.execute(stmt).scalar_one_or_none()
 
-        if periodic is None:
-            return False
+            if periodic is None:
+                return False
 
-        # Get task data
-        name = periodic.name
-        payload = periodic.payload
+            # Get task data
+            name = periodic.name
+            payload = periodic.payload
 
-        # Advance schedule BEFORE execution
-        periodic.last_run = func.now()
-        if periodic.cron:
-            periodic.next_run = _calculate_next_run_cron(periodic.cron)
-        else:
-            periodic.next_run = func.now() + periodic.run_every
-        session.commit()
+            # Advance schedule BEFORE execution
+            periodic.last_run = func.now()
+            if periodic.cron:
+                periodic.next_run = _calculate_next_run_cron(periodic.cron)
+            else:
+                periodic.next_run = func.now() + periodic.run_every
 
     except Exception as e:
-        session.rollback()
         logger.error(f"Error claiming periodic task: {e}")
         return False
-    finally:
-        session.close()
 
-    # Execute handler in forked process
-    if name is not None:
-        start = time.perf_counter()
-        try:
-            handler = resolve_function_path(name)
-            args, kwargs = deserialize(payload)
-            _execute_in_fork(handler, args, kwargs, max_runtime=max_runtime)
-            elapsed = time.perf_counter() - start
-            logger.debug(f"Periodic task '{name}' completed in {elapsed:.3f} s")
+    # Phase 2: Execute handler in forked process
+    start = time.perf_counter()
+    try:
+        handler = resolve_function_path(name)
+        args, kwargs = deserialize(payload)
+        _execute_in_fork(handler, args, kwargs, max_runtime=max_runtime)
+        elapsed = time.perf_counter() - start
+        logger.debug(f"Periodic task '{name}' completed in {elapsed:.3f} s")
 
-        except TaskTimeoutError:
-            elapsed = time.perf_counter() - start
-            logger.error(f"Periodic task '{name}' timed out after {elapsed:.3f} s")
+    except TaskTimeoutError:
+        elapsed = time.perf_counter() - start
+        logger.error(f"Periodic task '{name}' timed out after {elapsed:.3f} s")
 
-        except TaskOOMError as e:
-            elapsed = time.perf_counter() - start
-            logger.error(f"Periodic task '{name}' OOM after {elapsed:.3f} s: {e}")
+    except TaskOOMError as e:
+        elapsed = time.perf_counter() - start
+        logger.error(f"Periodic task '{name}' OOM after {elapsed:.3f} s: {e}")
 
-        except TaskKilledError as e:
-            elapsed = time.perf_counter() - start
-            logger.error(f"Periodic task '{name}' killed after {elapsed:.3f} s: {e}")
+    except TaskKilledError as e:
+        elapsed = time.perf_counter() - start
+        logger.error(f"Periodic task '{name}' killed after {elapsed:.3f} s: {e}")
 
-        except Exception as e:
-            elapsed = time.perf_counter() - start
-            logger.error(f"Periodic task '{name}' failed after {elapsed:.3f} s: {e}")
+    except Exception as e:
+        elapsed = time.perf_counter() - start
+        logger.error(f"Periodic task '{name}' failed after {elapsed:.3f} s: {e}")
 
-        return True
-
-    return False
+    return True
