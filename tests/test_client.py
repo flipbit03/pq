@@ -284,3 +284,162 @@ class TestClientId:
 
         assert task_id_1 != task_id_2
         assert pq.pending_count() == 2
+
+
+def upsert_handler(value: int = 0) -> None:
+    """Handler for upsert tests."""
+    pass
+
+
+def failing_upsert_handler() -> None:
+    """Failing handler for upsert tests."""
+    raise ValueError("boom")
+
+
+class TestUpsert:
+    """Tests for upsert method."""
+
+    def test_upsert_creates_new_task(self, pq: PQ) -> None:
+        """Upsert creates a new task when client_id doesn't exist."""
+        task_id = pq.upsert(upsert_handler, value=42, client_id="new-task")
+
+        assert task_id is not None
+        assert pq.pending_count() == 1
+
+        task = pq.get_task_by_client_id("new-task")
+        assert task is not None
+        assert task.id == task_id
+        assert task.payload["kwargs"] == {"value": 42}
+
+    def test_upsert_updates_existing_task(self, pq: PQ) -> None:
+        """Upsert updates task when client_id already exists."""
+        # Create initial task
+        task_id_1 = pq.upsert(upsert_handler, value=1, client_id="my-task")
+
+        # Upsert with same client_id
+        task_id_2 = pq.upsert(upsert_handler, value=2, client_id="my-task")
+
+        # Should still have only 1 task
+        assert pq.pending_count() == 1
+        # Should return the same task ID
+        assert task_id_1 == task_id_2
+
+        task = pq.get_task_by_client_id("my-task")
+        assert task is not None
+        # Should have updated payload
+        assert task.payload["kwargs"] == {"value": 2}
+
+    def test_upsert_resets_status_to_pending(self, pq: PQ) -> None:
+        """Upsert resets status to PENDING on conflict."""
+        from pq.models import TaskStatus
+
+        # Create and process task
+        pq.upsert(dummy_handler, client_id="reset-test")
+        pq.run_worker_once()
+
+        # Task should be completed
+        task = pq.get_task_by_client_id("reset-test")
+        assert task is not None
+        assert task.status == TaskStatus.COMPLETED
+
+        # Upsert same client_id
+        pq.upsert(dummy_handler, client_id="reset-test")
+
+        # Status should be reset to PENDING
+        task = pq.get_task_by_client_id("reset-test")
+        assert task is not None
+        assert task.status == TaskStatus.PENDING
+
+    def test_upsert_resets_attempts_to_zero(self, pq: PQ) -> None:
+        """Upsert resets attempts to 0 on conflict."""
+        # Create and process task
+        pq.upsert(dummy_handler, client_id="attempts-test")
+        pq.run_worker_once()
+
+        task = pq.get_task_by_client_id("attempts-test")
+        assert task is not None
+        assert task.attempts == 1
+
+        # Upsert same client_id
+        pq.upsert(dummy_handler, client_id="attempts-test")
+
+        task = pq.get_task_by_client_id("attempts-test")
+        assert task is not None
+        assert task.attempts == 0
+
+    def test_upsert_clears_timestamps(self, pq: PQ) -> None:
+        """Upsert clears started_at and completed_at on conflict."""
+        # Create and process task
+        pq.upsert(dummy_handler, client_id="timestamps-test")
+        pq.run_worker_once()
+
+        task = pq.get_task_by_client_id("timestamps-test")
+        assert task is not None
+        assert task.started_at is not None
+        assert task.completed_at is not None
+
+        # Upsert same client_id
+        pq.upsert(dummy_handler, client_id="timestamps-test")
+
+        task = pq.get_task_by_client_id("timestamps-test")
+        assert task is not None
+        assert task.started_at is None
+        assert task.completed_at is None
+
+    def test_upsert_clears_error(self, pq: PQ) -> None:
+        """Upsert clears error field on conflict."""
+        from pq.models import TaskStatus
+
+        pq.upsert(failing_upsert_handler, client_id="error-test")
+        pq.run_worker_once()
+
+        task = pq.get_task_by_client_id("error-test")
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert task.error is not None
+
+        # Upsert same client_id with different handler
+        pq.upsert(dummy_handler, client_id="error-test")
+
+        task = pq.get_task_by_client_id("error-test")
+        assert task is not None
+        assert task.error is None
+
+    def test_upsert_updates_priority(self, pq: PQ) -> None:
+        """Upsert updates priority on conflict."""
+        from pq.priority import Priority
+
+        pq.upsert(dummy_handler, client_id="priority-test", priority=Priority.LOW)
+
+        task = pq.get_task_by_client_id("priority-test")
+        assert task is not None
+        assert task.priority == Priority.LOW.value
+
+        pq.upsert(dummy_handler, client_id="priority-test", priority=Priority.HIGH)
+
+        task = pq.get_task_by_client_id("priority-test")
+        assert task is not None
+        assert task.priority == Priority.HIGH.value
+
+    def test_upsert_updates_run_at(self, pq: PQ) -> None:
+        """Upsert updates run_at on conflict."""
+        now = datetime.now(UTC)
+        future = now + timedelta(hours=2)
+
+        pq.upsert(dummy_handler, client_id="run-at-test", run_at=now)
+
+        task = pq.get_task_by_client_id("run-at-test")
+        assert task is not None
+        assert abs((task.run_at - now).total_seconds()) < 1
+
+        pq.upsert(dummy_handler, client_id="run-at-test", run_at=future)
+
+        task = pq.get_task_by_client_id("run-at-test")
+        assert task is not None
+        assert abs((task.run_at - future).total_seconds()) < 1
+
+    def test_upsert_returns_int_id(self, pq: PQ) -> None:
+        """Upsert returns an integer ID."""
+        task_id = pq.upsert(dummy_handler, client_id="int-test")
+        assert isinstance(task_id, int)
+        assert task_id > 0
