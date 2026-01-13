@@ -162,6 +162,71 @@ class PQ:
             session.flush()
             return task_obj.id
 
+    def upsert(
+        self,
+        task: Callable[..., Any],
+        *args: Any,
+        run_at: datetime | None = None,
+        priority: Priority = Priority.NORMAL,
+        client_id: str,
+        **kwargs: Any,
+    ) -> int:
+        """Enqueue a task, updating if client_id already exists.
+
+        Behaves like enqueue(), but on conflict for client_id, updates all fields.
+        Status resets to PENDING, attempts to 0, and timestamps are cleared.
+
+        Args:
+            task: Callable function to execute.
+            *args: Positional arguments to pass to the handler.
+            run_at: When to run the task. Defaults to now.
+            priority: Task priority. Higher = higher priority. Defaults to NORMAL.
+            client_id: Client-provided identifier. Required for conflict resolution.
+            **kwargs: Keyword arguments to pass to the handler.
+
+        Returns:
+            Task ID.
+
+        Raises:
+            ValueError: If task is a lambda, closure, or cannot be imported.
+        """
+        name = get_function_path(task)
+        payload = serialize(args, kwargs)
+
+        if run_at is None:
+            run_at = datetime.now(UTC)
+
+        stmt = (
+            insert(Task)
+            .values(
+                client_id=client_id,
+                name=name,
+                payload=payload,
+                priority=priority,
+                status=TaskStatus.PENDING,
+                run_at=run_at,
+            )
+            .on_conflict_do_update(
+                index_elements=["client_id"],
+                set_={
+                    "name": name,
+                    "payload": payload,
+                    "priority": priority,
+                    "status": TaskStatus.PENDING,
+                    "run_at": run_at,
+                    "attempts": 0,
+                    "started_at": None,
+                    "completed_at": None,
+                    "error": None,
+                },
+            )
+            .returning(Task.id)
+        )
+
+        with self.session() as session:
+            result = session.execute(stmt)
+            return result.scalar_one()
+
     def schedule(
         self,
         task: Callable[..., Any],
