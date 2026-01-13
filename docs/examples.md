@@ -98,8 +98,70 @@ pq.enqueue(process_order, order_id=123, client_id="order-123")
 task = pq.get_task_by_client_id("order-123")
 print(f"Task status: {task.status}")
 
+# Cancel by client_id
+if task:
+    pq.cancel(task.id)
+
 # Duplicate client_id raises IntegrityError
 # pq.enqueue(process_order, order_id=456, client_id="order-123")  # Error!
+```
+
+## Upsert
+
+Use `upsert()` to insert or update a task by `client_id`. Unlike `enqueue()`, it won't raise on duplicates - it updates the existing task instead.
+
+```python
+from pq import PQ
+
+pq = PQ("postgresql://localhost/mydb")
+
+def send_notification(user_id: int, message: str) -> None:
+    print(f"Notifying user {user_id}: {message}")
+
+# First call creates the task
+pq.upsert(send_notification, user_id=42, message="Hello", client_id="notify-42")
+
+# Second call updates the existing task (resets status to PENDING)
+pq.upsert(send_notification, user_id=42, message="Updated!", client_id="notify-42")
+
+# Useful for debouncing - only the latest version runs
+for i in range(100):
+    pq.upsert(send_notification, user_id=42, message=f"Message {i}", client_id="notify-42")
+# Only the last message will be processed
+```
+
+## Worker Lifecycle Hooks
+
+Use `pre_execute` and `post_execute` hooks to run code before/after task execution. Hooks run in the forked child process, making them ideal for fork-unsafe resources like OpenTelemetry.
+
+```python
+from pq import PQ, Task, Periodic
+
+pq = PQ("postgresql://localhost/mydb")
+
+def setup_otel(task: Task | Periodic) -> None:
+    """Called before task execution in forked child."""
+    # Initialize tracer, create span, etc.
+    print(f"[OTel] Starting span for {task.name}")
+
+def flush_otel(task: Task | Periodic, error: Exception | None) -> None:
+    """Called after task execution (success or failure)."""
+    if error:
+        print(f"[OTel] Recording error: {error}")
+    print(f"[OTel] Flushing traces for {task.name}")
+
+# Run worker with hooks
+pq.run_worker(pre_execute=setup_otel, post_execute=flush_otel)
+```
+
+Hooks receive the full task object with metadata:
+
+```python
+def pre_hook(task: Task | Periodic) -> None:
+    print(f"Task ID: {task.id}")
+    print(f"Task name: {task.name}")
+    print(f"Client ID: {task.client_id}")
+    print(f"Priority: {task.priority}")
 ```
 
 ## Error Handling

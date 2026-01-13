@@ -9,6 +9,7 @@
         - __init__
         - run_db_migrations
         - enqueue
+        - upsert
         - schedule
         - unschedule
         - cancel
@@ -34,6 +35,26 @@
 ## TaskStatus
 
 ::: pq.TaskStatus
+    options:
+      show_source: false
+
+## Models
+
+::: pq.Task
+    options:
+      show_source: false
+
+::: pq.Periodic
+    options:
+      show_source: false
+
+## Worker Hooks
+
+::: pq.PreExecuteHook
+    options:
+      show_source: false
+
+::: pq.PostExecuteHook
     options:
       show_source: false
 

@@ -73,6 +73,36 @@ task_id = pq.enqueue(my_task)
 pq.cancel(task_id)  # Returns True if found and cancelled
 ```
 
+### Client IDs
+
+Use `client_id` for idempotency and lookups:
+
+```python
+# Enqueue with a client-provided ID
+pq.enqueue(process_order, order_id=123, client_id="order-123")
+
+# Look up by client_id
+task = pq.get_task_by_client_id("order-123")
+if task:
+    pq.cancel(task.id)
+
+# Duplicate client_id raises IntegrityError
+```
+
+### Upsert
+
+Insert or update a task by `client_id`:
+
+```python
+# First call creates task
+pq.upsert(send_email, to="a@b.com", client_id="welcome-email")
+
+# Second call updates the existing task (resets to PENDING)
+pq.upsert(send_email, to="new@b.com", client_id="welcome-email")
+```
+
+Unlike `enqueue()`, `upsert()` requires `client_id` and won't raise on duplicates.
+
 ## Periodic Tasks
 
 ### Intervals
@@ -147,6 +177,27 @@ python -c "from myapp import pq; from pq import Priority; pq.run_worker(prioriti
 # Terminal 2-3: All priorities
 python -c "from myapp import pq; pq.run_worker()"
 ```
+
+### Lifecycle Hooks
+
+Run code before/after task execution in the forked child process:
+
+```python
+from pq import PQ, Task, Periodic
+
+def setup_tracing(task: Task | Periodic) -> None:
+    # Initialize OTel tracer, create span, etc.
+    print(f"Starting task: {task.name}")
+
+def flush_tracing(task: Task | Periodic, error: Exception | None) -> None:
+    # Flush traces, cleanup resources
+    if error:
+        print(f"Task failed: {error}")
+
+pq.run_worker(pre_execute=setup_tracing, post_execute=flush_tracing)
+```
+
+Hooks run in the forked child, making them safe for fork-unsafe resources like OpenTelemetry.
 
 ## Serialization
 

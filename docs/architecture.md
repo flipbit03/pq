@@ -86,14 +86,18 @@ flowchart LR
 
     subgraph child["Child Process"]
         setup["Set timeout"]
+        pre["pre_execute()"]
         exec["Execute handler"]
+        post["post_execute()"]
         exit["exit()"]
     end
 
     poll --> fork
     fork --> setup
-    setup --> exec
-    exec --> exit
+    setup --> pre
+    pre --> exec
+    exec --> post
+    post --> exit
     exit -.->|"exit code"| wait
     wait --> update
     update --> poll
@@ -114,6 +118,27 @@ The parent monitors the child via `wait4()` and detects:
 - **Memory isolation** - Child OOM doesn't crash worker
 - **Crash isolation** - Segfaults only kill the child
 - **Clean state** - Each task starts fresh
+- **Hook safety** - Lifecycle hooks run in the child, safe for fork-unsafe resources
+
+### Lifecycle Hooks
+
+Optional `pre_execute` and `post_execute` hooks run in the forked child:
+
+```python
+from pq import Task, Periodic
+
+def pre_execute(task: Task | Periodic) -> None:
+    # Initialize fork-unsafe resources (OTel, DB connections)
+    pass
+
+def post_execute(task: Task | Periodic, error: Exception | None) -> None:
+    # Cleanup/flush (OTel traces, etc.)
+    pass
+
+pq.run_worker(pre_execute=pre_execute, post_execute=post_execute)
+```
+
+This is essential for OpenTelemetry and similar libraries that don't survive `fork()`.
 
 ## Concurrency
 
