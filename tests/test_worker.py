@@ -402,6 +402,190 @@ class TestAsyncTasks:
         assert pq.pending_count() == 0
 
 
+class TestHooks:
+    """Tests for pre_execute/post_execute hooks."""
+
+    def test_pre_execute_hook_called_for_one_off_task(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Pre-execute hook is called before one-off task execution."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        def pre_hook(task: Any) -> None:
+            _shared_results.append(("pre", task.name))
+
+        pq.enqueue(noop_handler)
+
+        from pq.worker import run_worker_once
+
+        run_worker_once(pq, pre_execute=pre_hook)
+
+        assert len(results) == 1
+        assert results[0][0] == "pre"
+        assert "noop_handler" in results[0][1]
+
+    def test_post_execute_hook_called_for_one_off_task(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Post-execute hook is called after one-off task execution."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        def post_hook(task: Any, error: Exception | None) -> None:
+            _shared_results.append(("post", task.name, error))
+
+        pq.enqueue(noop_handler)
+
+        from pq.worker import run_worker_once
+
+        run_worker_once(pq, post_execute=post_hook)
+
+        assert len(results) == 1
+        assert results[0][0] == "post"
+        assert "noop_handler" in results[0][1]
+        assert results[0][2] is None  # No error
+
+    def test_post_execute_hook_receives_error_on_failure(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Post-execute hook receives error when task fails."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        def post_hook(task: Any, error: Exception | None) -> None:
+            _shared_results.append(
+                ("post", error is not None, str(error) if error else None)
+            )
+
+        pq.enqueue(failing_handler)
+
+        from pq.worker import run_worker_once
+
+        run_worker_once(pq, post_execute=post_hook)
+
+        assert len(results) == 1
+        assert results[0][0] == "post"
+        assert results[0][1] is True  # Had error
+        assert "boom" in results[0][2]  # Error message contains "boom"
+
+    def test_pre_execute_hook_called_for_periodic_task(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Pre-execute hook is called before periodic task execution."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        def pre_hook(task: Any) -> None:
+            _shared_results.append(("pre", task.name))
+
+        pq.schedule(periodic_noop_handler, run_every=timedelta(hours=1))
+
+        from pq.worker import run_worker_once
+
+        run_worker_once(pq, pre_execute=pre_hook)
+
+        assert len(results) == 1
+        assert results[0][0] == "pre"
+        assert "periodic_noop_handler" in results[0][1]
+
+    def test_post_execute_hook_called_for_periodic_task(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Post-execute hook is called after periodic task execution."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        def post_hook(task: Any, error: Exception | None) -> None:
+            _shared_results.append(("post", task.name, error))
+
+        pq.schedule(periodic_noop_handler, run_every=timedelta(hours=1))
+
+        from pq.worker import run_worker_once
+
+        run_worker_once(pq, post_execute=post_hook)
+
+        assert len(results) == 1
+        assert results[0][0] == "post"
+        assert "periodic_noop_handler" in results[0][1]
+        assert results[0][2] is None  # No error
+
+    def test_both_hooks_called_in_order(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Pre and post hooks are called in correct order."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        def pre_hook(task: Any) -> None:
+            _shared_results.append("pre")
+
+        def post_hook(task: Any, error: Exception | None) -> None:
+            _shared_results.append("post")
+
+        pq.enqueue(noop_handler)
+
+        from pq.worker import run_worker_once
+
+        run_worker_once(pq, pre_execute=pre_hook, post_execute=post_hook)
+
+        assert list(results) == ["pre", "post"]
+
+    def test_hook_receives_task_object_with_correct_fields(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Hooks receive task object with expected fields."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        def pre_hook(task: Any) -> None:
+            _shared_results.append(
+                {
+                    "has_id": hasattr(task, "id"),
+                    "has_name": hasattr(task, "name"),
+                    "has_payload": hasattr(task, "payload"),
+                    "has_client_id": hasattr(task, "client_id"),
+                }
+            )
+
+        pq.enqueue(noop_handler, client_id="hook-test")
+
+        from pq.worker import run_worker_once
+
+        run_worker_once(pq, pre_execute=pre_hook)
+
+        assert len(results) == 1
+        task_info = results[0]
+        assert task_info["has_id"] is True
+        assert task_info["has_name"] is True
+        assert task_info["has_payload"] is True
+        assert task_info["has_client_id"] is True
+
+    def test_post_execute_called_even_when_pre_execute_fails(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Post-execute hook is called even if pre-execute hook raises."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        def pre_hook(task: Any) -> None:
+            _shared_results.append("pre")
+            raise RuntimeError("pre hook failed")
+
+        def post_hook(task: Any, error: Exception | None) -> None:
+            _shared_results.append("post")
+
+        pq.enqueue(noop_handler)
+
+        from pq.worker import run_worker_once
+
+        run_worker_once(pq, pre_execute=pre_hook, post_execute=post_hook)
+
+        # Both should be called (post catches the pre-hook error)
+        assert "pre" in results
+        assert "post" in results
+
+
 class TestTaskTimeout:
     """Tests for task timeout functionality."""
 
