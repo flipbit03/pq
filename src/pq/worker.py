@@ -14,7 +14,7 @@ import sys
 import time
 import traceback
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from croniter import croniter
 from loguru import logger
@@ -29,6 +29,40 @@ if TYPE_CHECKING:
 
     from pq.client import PQ
     from pq.priority import Priority
+
+
+class PreExecuteHook(Protocol):
+    """Protocol for pre-execution hooks called before task handler runs.
+
+    Called in the forked child process before task execution.
+    Use for initializing fork-unsafe resources (OTel, DB connections).
+    """
+
+    def __call__(self, task: Task | Periodic) -> None:
+        """Called before task execution.
+
+        Args:
+            task: The task about to be executed.
+        """
+        ...
+
+
+class PostExecuteHook(Protocol):
+    """Protocol for post-execution hooks called after task handler completes.
+
+    Called in the forked child process after task execution (success or failure).
+    Use for cleanup/flushing (OTel traces, etc.).
+    """
+
+    def __call__(self, task: Task | Periodic, error: Exception | None) -> None:
+        """Called after task execution.
+
+        Args:
+            task: The task that was executed.
+            error: The exception if task failed, None if successful.
+        """
+        ...
+
 
 # Default max runtime: 30 minutes
 DEFAULT_MAX_RUNTIME: float = 30 * 60
@@ -80,6 +114,9 @@ def _run_in_child(
     kwargs: dict[str, Any],
     max_runtime: float,
     error_write_fd: int,
+    task: Task | Periodic,
+    pre_execute: PreExecuteHook | None,
+    post_execute: PostExecuteHook | None,
 ) -> None:
     """Execute handler in child process.
 
@@ -92,20 +129,40 @@ def _run_in_child(
     signal.signal(signal.SIGALRM, _child_timeout_handler)
     signal.alarm(int(max_runtime) + 1)  # +1 buffer for async timeout
 
+    error: Exception | None = None
+    error_tb: str = ""
+
     try:
+        if pre_execute:
+            pre_execute(task)
+
         if inspect.iscoroutinefunction(handler):
             asyncio.run(asyncio.wait_for(handler(*args, **kwargs), timeout=max_runtime))
         else:
             handler(*args, **kwargs)
-        os._exit(EXIT_SUCCESS)
 
-    except asyncio.TimeoutError:
-        os._exit(EXIT_TIMEOUT)
+    except asyncio.TimeoutError as e:
+        error = e
 
     except Exception as e:
+        error = e
+        error_tb = traceback.format_exc()
+
+    finally:
+        try:
+            if post_execute:
+                post_execute(task, error)
+        except Exception:
+            pass  # Don't let hook errors mask task errors
+
+    if error is None:
+        os._exit(EXIT_SUCCESS)
+    elif isinstance(error, asyncio.TimeoutError):
+        os._exit(EXIT_TIMEOUT)
+    else:
         # Send error message to parent via pipe
         try:
-            error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            error_msg = f"{type(error).__name__}: {error}\n{error_tb}"
             os.write(error_write_fd, error_msg.encode("utf-8", errors="replace"))
         except Exception:
             pass  # Best effort
@@ -118,6 +175,9 @@ def _execute_in_fork(
     kwargs: dict[str, Any],
     *,
     max_runtime: float,
+    task: Task | Periodic,
+    pre_execute: PreExecuteHook | None = None,
+    post_execute: PostExecuteHook | None = None,
 ) -> None:
     """Execute handler in a forked child process for isolation.
 
@@ -130,6 +190,9 @@ def _execute_in_fork(
         args: Positional arguments for handler.
         kwargs: Keyword arguments for handler.
         max_runtime: Maximum execution time in seconds.
+        task: The task being executed (passed to hooks).
+        pre_execute: Called in forked child BEFORE task execution.
+        post_execute: Called in forked child AFTER task execution.
 
     Raises:
         TaskTimeoutError: If task exceeds max runtime.
@@ -145,7 +208,16 @@ def _execute_in_fork(
     if child_pid == 0:
         # === CHILD PROCESS ===
         os.close(read_fd)
-        _run_in_child(handler, args, kwargs, max_runtime, write_fd)
+        _run_in_child(
+            handler,
+            args,
+            kwargs,
+            max_runtime,
+            write_fd,
+            task,
+            pre_execute,
+            post_execute,
+        )
         # _run_in_child never returns, but just in case:
         os._exit(EXIT_FAILURE)
 
@@ -239,6 +311,8 @@ def run_worker(
     priorities: Set[Priority] | None = None,
     retention_days: int = DEFAULT_RETENTION_DAYS,
     cleanup_interval: float = DEFAULT_CLEANUP_INTERVAL,
+    pre_execute: PreExecuteHook | None = None,
+    post_execute: PostExecuteHook | None = None,
 ) -> None:
     """Run the worker loop indefinitely.
 
@@ -253,6 +327,10 @@ def run_worker(
         retention_days: Days to keep completed/failed tasks. Default: 7.
             Set to 0 to disable automatic cleanup.
         cleanup_interval: Seconds between cleanup runs. Default: 3600 (1 hour).
+        pre_execute: Called in forked child BEFORE task execution.
+            Use for initializing fork-unsafe resources (OTel, DB connections).
+        post_execute: Called in forked child AFTER task execution (success or failure).
+            Use for cleanup/flushing (OTel traces, etc.).
     """
     if priorities:
         priority_names = ", ".join(p.name for p in sorted(priorities, reverse=True))
@@ -264,7 +342,13 @@ def run_worker(
 
     try:
         while True:
-            if not run_worker_once(pq, max_runtime=max_runtime, priorities=priorities):
+            if not run_worker_once(
+                pq,
+                max_runtime=max_runtime,
+                priorities=priorities,
+                pre_execute=pre_execute,
+                post_execute=post_execute,
+            ):
                 _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
@@ -276,6 +360,8 @@ def run_worker_once(
     *,
     max_runtime: float = DEFAULT_MAX_RUNTIME,
     priorities: Set[Priority] | None = None,
+    pre_execute: PreExecuteHook | None = None,
+    post_execute: PostExecuteHook | None = None,
 ) -> bool:
     """Process a single task if available.
 
@@ -285,16 +371,32 @@ def run_worker_once(
         pq: PQ client instance.
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
         priorities: If set, only process tasks with these priority levels.
+        pre_execute: Called in forked child BEFORE task execution.
+            Use for initializing fork-unsafe resources (OTel, DB connections).
+        post_execute: Called in forked child AFTER task execution (success or failure).
+            Use for cleanup/flushing (OTel traces, etc.).
 
     Returns:
         True if a task was processed, False if queue was empty.
     """
     # Try one-off task first
-    if _process_one_off_task(pq, max_runtime=max_runtime, priorities=priorities):
+    if _process_one_off_task(
+        pq,
+        max_runtime=max_runtime,
+        priorities=priorities,
+        pre_execute=pre_execute,
+        post_execute=post_execute,
+    ):
         return True
 
     # Try periodic task
-    if _process_periodic_task(pq, max_runtime=max_runtime, priorities=priorities):
+    if _process_periodic_task(
+        pq,
+        max_runtime=max_runtime,
+        priorities=priorities,
+        pre_execute=pre_execute,
+        post_execute=post_execute,
+    ):
         return True
 
     return False
@@ -305,6 +407,8 @@ def _process_one_off_task(
     *,
     max_runtime: float,
     priorities: Set[Priority] | None = None,
+    pre_execute: PreExecuteHook | None = None,
+    post_execute: PostExecuteHook | None = None,
 ) -> bool:
     """Claim and process a one-off task.
 
@@ -312,11 +416,14 @@ def _process_one_off_task(
         pq: PQ client instance.
         max_runtime: Maximum execution time in seconds.
         priorities: If set, only process tasks with these priority levels.
+        pre_execute: Called in forked child BEFORE task execution.
+        post_execute: Called in forked child AFTER task execution.
 
     Returns:
         True if a task was processed.
     """
     # Phase 1: Claim task
+    task: Task | None = None
     try:
         with pq.session() as session:
             # Claim highest priority pending task with FOR UPDATE SKIP LOCKED
@@ -347,6 +454,10 @@ def _process_one_off_task(
             payload = task.payload
             task_id = task.id
 
+            # Flush to commit status changes, then expunge for forked process
+            session.flush()
+            session.expunge(task)
+
     except Exception as e:
         logger.error(f"Error claiming task: {e}")
         return False
@@ -359,7 +470,15 @@ def _process_one_off_task(
     try:
         handler = resolve_function_path(name)
         args, kwargs = deserialize(payload)
-        _execute_in_fork(handler, args, kwargs, max_runtime=max_runtime)
+        _execute_in_fork(
+            handler,
+            args,
+            kwargs,
+            max_runtime=max_runtime,
+            task=task,
+            pre_execute=pre_execute,
+            post_execute=post_execute,
+        )
 
     except TaskTimeoutError:
         status = TaskStatus.FAILED
@@ -419,6 +538,8 @@ def _process_periodic_task(
     *,
     max_runtime: float,
     priorities: Set[Priority] | None = None,
+    pre_execute: PreExecuteHook | None = None,
+    post_execute: PostExecuteHook | None = None,
 ) -> bool:
     """Claim and process a periodic task.
 
@@ -426,11 +547,14 @@ def _process_periodic_task(
         pq: PQ client instance.
         max_runtime: Maximum execution time in seconds.
         priorities: If set, only process tasks with these priority levels.
+        pre_execute: Called in forked child BEFORE task execution.
+        post_execute: Called in forked child AFTER task execution.
 
     Returns:
         True if a task was processed.
     """
     # Phase 1: Claim and advance schedule
+    periodic: Periodic | None = None
     try:
         with pq.session() as session:
             # Claim highest priority due periodic task with FOR UPDATE SKIP LOCKED
@@ -458,6 +582,10 @@ def _process_periodic_task(
             else:
                 periodic.next_run = func.now() + periodic.run_every
 
+            # Flush to commit schedule changes, then expunge for forked process
+            session.flush()
+            session.expunge(periodic)
+
     except Exception as e:
         logger.error(f"Error claiming periodic task: {e}")
         return False
@@ -467,7 +595,15 @@ def _process_periodic_task(
     try:
         handler = resolve_function_path(name)
         args, kwargs = deserialize(payload)
-        _execute_in_fork(handler, args, kwargs, max_runtime=max_runtime)
+        _execute_in_fork(
+            handler,
+            args,
+            kwargs,
+            max_runtime=max_runtime,
+            task=periodic,
+            pre_execute=pre_execute,
+            post_execute=post_execute,
+        )
         elapsed = time.perf_counter() - start
         logger.debug(f"Periodic task '{name}' completed in {elapsed:.3f} s")
 
