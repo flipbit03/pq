@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from croniter import croniter
 from loguru import logger
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 
 from pq.models import Periodic, Task, TaskStatus
 from pq.registry import resolve_function_path
@@ -558,7 +558,15 @@ def _process_periodic_task(
     try:
         with pq.session() as session:
             # Claim highest priority due periodic task with FOR UPDATE SKIP LOCKED
-            stmt = select(Periodic).where(Periodic.next_run <= func.now())
+            # Filter out tasks that are locked (max_concurrent=1 and locked_until in future)
+            stmt = select(Periodic).where(
+                Periodic.next_run <= func.now(),
+                or_(
+                    Periodic.max_concurrent.is_(None),
+                    Periodic.locked_until.is_(None),
+                    Periodic.locked_until <= func.now(),
+                ),
+            )
             if priorities:
                 stmt = stmt.where(Periodic.priority.in_([p.value for p in priorities]))
             stmt = (
@@ -571,9 +579,16 @@ def _process_periodic_task(
             if periodic is None:
                 return False
 
-            # Get task data
+            # Get task data before expunge
             name = periodic.name
             payload = periodic.payload
+            periodic_id = periodic.id
+            periodic_max_concurrent = periodic.max_concurrent
+
+            # Set lock before execution if concurrency is limited
+            if periodic.max_concurrent is not None:
+                lock_duration = max_runtime if max_runtime > 0 else 3600
+                periodic.locked_until = func.now() + timedelta(seconds=lock_duration)
 
             # Advance schedule BEFORE execution
             periodic.last_run = func.now()
@@ -622,5 +637,18 @@ def _process_periodic_task(
     except Exception as e:
         elapsed = time.perf_counter() - start
         logger.error(f"Periodic task '{name}' failed after {elapsed:.3f} s: {e}")
+
+    finally:
+        # Clear lock after execution (success or failure)
+        if periodic_max_concurrent is not None:
+            try:
+                with pq.session() as session:
+                    session.execute(
+                        update(Periodic)
+                        .where(Periodic.id == periodic_id)
+                        .values(locked_until=None)
+                    )
+            except Exception as e:
+                logger.error(f"Failed to clear lock for periodic task '{name}': {e}")
 
     return True

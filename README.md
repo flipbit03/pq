@@ -14,7 +14,7 @@ Postgres-backed job queue for Python with fork-based worker isolation.
 ## Installation
 
 ```bash
-uv add pq
+uv add python-pq
 ```
 
 Requires PostgreSQL and Python 3.13+.
@@ -130,6 +130,20 @@ pq.schedule(weekly_report, cron="0 9 * * 1")  # Monday 9am
 ```python
 pq.schedule(report, run_every=timedelta(hours=1), report_type="hourly")
 ```
+
+### Overlap Control
+
+By default, periodic tasks don't overlap — if an instance is still running when the next tick arrives, the tick is skipped:
+
+```python
+# Default: max_concurrent=1, no overlap
+pq.schedule(sync_inventory, run_every=timedelta(minutes=5))
+
+# Opt in to unlimited concurrency (overlap allowed)
+pq.schedule(fast_idempotent_task, run_every=timedelta(seconds=30), max_concurrent=None)
+```
+
+The lock auto-expires after `max_runtime` seconds (or 1 hour by default) for crash safety.
 
 ### Unscheduling
 

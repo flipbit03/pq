@@ -88,7 +88,11 @@ class Periodic(Base):
     run_every: Mapped[timedelta | None] = mapped_column(Interval, nullable=True)
     cron: Mapped[str | None] = mapped_column(String(100), nullable=True)
     next_run: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    max_concurrent: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     last_run: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(

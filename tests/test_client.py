@@ -164,6 +164,74 @@ class TestSchedule:
             assert periodic.run_every is None
 
 
+class TestScheduleMaxConcurrent:
+    """Tests for max_concurrent parameter in schedule."""
+
+    def test_schedule_with_max_concurrent(self, pq: PQ) -> None:
+        """Schedule stores max_concurrent in DB."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), max_concurrent=1)
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.max_concurrent == 1
+
+    def test_schedule_with_max_concurrent_none(self, pq: PQ) -> None:
+        """Schedule stores max_concurrent=None for unlimited concurrency."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), max_concurrent=None)
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.max_concurrent is None
+
+    def test_schedule_upserts_max_concurrent(self, pq: PQ) -> None:
+        """Schedule upsert updates max_concurrent value."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), max_concurrent=1)
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), max_concurrent=None)
+
+        assert pq.periodic_count() == 1
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.max_concurrent is None
+
+    def test_schedule_max_concurrent_invalid_raises(self, pq: PQ) -> None:
+        """Schedule with max_concurrent > 1 raises ValueError."""
+        with pytest.raises(ValueError, match="max_concurrent must be 1 or None"):
+            pq.schedule(cleanup_handler, run_every=timedelta(hours=1), max_concurrent=2)
+
+    def test_schedule_max_concurrent_default(self, pq: PQ) -> None:
+        """Schedule without max_concurrent defaults to 1."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.max_concurrent == 1
+
+
 class TestCancel:
     """Tests for cancel method."""
 
