@@ -64,7 +64,8 @@ pq.schedule(cleanup, run_every=timedelta(hours=1))
 
 | Column | Purpose |
 |--------|---------|
-| `name` | Function path (unique) |
+| `name` | Function path (unique with `key`) |
+| `key` | Discriminator for multiple schedules of the same function (default `""`) |
 | `payload` | JSONB with serialized args/kwargs |
 | `priority` | 0-100, higher runs first |
 | `run_every` | Interval (e.g., 1 hour) |
