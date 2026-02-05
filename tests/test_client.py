@@ -232,6 +232,70 @@ class TestScheduleMaxConcurrent:
             assert periodic.max_concurrent == 1
 
 
+class TestPeriodicKey:
+    """Tests for periodic task key discriminator."""
+
+    def test_different_keys_create_separate_entries(self, pq: PQ) -> None:
+        """Same function with different keys creates separate periodic entries."""
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), key="us")
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=2), key="eu")
+
+        assert pq.periodic_count() == 2
+
+    def test_same_key_upserts(self, pq: PQ) -> None:
+        """Same function + same key upserts (updates) the existing entry."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), key="region")
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=2), key="region")
+
+        assert pq.periodic_count() == 1
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.run_every == timedelta(hours=2)
+
+    def test_unschedule_with_key_removes_only_that_entry(self, pq: PQ) -> None:
+        """Unschedule with key only removes the matching entry."""
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), key="us")
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=2), key="eu")
+        assert pq.periodic_count() == 2
+
+        result = pq.unschedule(cleanup_handler, key="us")
+
+        assert result is True
+        assert pq.periodic_count() == 1
+
+    def test_unschedule_without_key_removes_default_entry(self, pq: PQ) -> None:
+        """Unschedule without key only removes the default-key entry."""
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=2), key="eu")
+        assert pq.periodic_count() == 2
+
+        result = pq.unschedule(cleanup_handler)
+
+        assert result is True
+        assert pq.periodic_count() == 1
+
+    def test_default_key_is_empty_string(self, pq: PQ) -> None:
+        """Omitting key stores empty string in DB."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.key == ""
+
+
 class TestCancel:
     """Tests for cancel method."""
 
