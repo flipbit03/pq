@@ -15,6 +15,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -76,13 +77,15 @@ class Periodic(Base):
     __tablename__ = "pq_periodic"
     __table_args__ = (
         Index("ix_pq_periodic_priority_next_run", "priority", "next_run"),
+        UniqueConstraint("name", "key"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     client_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True, unique=True, index=True
     )
-    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    key: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
     run_every: Mapped[timedelta | None] = mapped_column(Interval, nullable=True)

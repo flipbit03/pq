@@ -236,6 +236,7 @@ class PQ:
         priority: Priority = Priority.NORMAL,
         client_id: str | None = None,
         max_concurrent: int | None = 1,
+        key: str = "",
         **kwargs: Any,
     ) -> int:
         """Schedule a periodic task.
@@ -253,6 +254,8 @@ class PQ:
             max_concurrent: Maximum concurrent executions. Default 1 (no overlap).
                 Set to None for unlimited concurrency. Values > 1 are reserved
                 for future use and raise ValueError.
+            key: Discriminator for multiple schedules of the same function.
+                Defaults to "" (empty string).
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
@@ -305,6 +308,7 @@ class PQ:
                 insert(Periodic)
                 .values(
                     name=name,
+                    key=key,
                     payload=payload,
                     priority=priority,
                     run_every=run_every,
@@ -314,7 +318,7 @@ class PQ:
                     max_concurrent=max_concurrent,
                 )
                 .on_conflict_do_update(
-                    index_elements=["name"],
+                    index_elements=["name", "key"],
                     set_={
                         "payload": payload,
                         "priority": priority,
@@ -343,18 +347,19 @@ class PQ:
             result = session.execute(stmt)
             return result.rowcount > 0
 
-    def unschedule(self, task: Callable[..., Any]) -> bool:
+    def unschedule(self, task: Callable[..., Any], *, key: str = "") -> bool:
         """Remove a periodic task.
 
         Args:
             task: The scheduled function to remove.
+            key: Discriminator key. Defaults to "" (the default schedule).
 
         Returns:
             True if task was found and deleted, False otherwise.
         """
         name = get_function_path(task)
         with self.session() as session:
-            stmt = delete(Periodic).where(Periodic.name == name)
+            stmt = delete(Periodic).where(Periodic.name == name, Periodic.key == key)
             result = session.execute(stmt)
             return result.rowcount > 0
 

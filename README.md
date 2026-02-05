@@ -145,6 +145,20 @@ pq.schedule(fast_idempotent_task, run_every=timedelta(seconds=30), max_concurren
 
 The lock auto-expires after `max_runtime` seconds (or 1 hour by default) for crash safety.
 
+### Multiple Schedules (Key)
+
+Use `key` to register the same function multiple times with different configurations:
+
+```python
+pq.schedule(sync_data, run_every=timedelta(hours=1), key="us", region="us")
+pq.schedule(sync_data, run_every=timedelta(hours=2), key="eu", region="eu")
+
+# Unschedule only the US schedule
+pq.unschedule(sync_data, key="us")
+```
+
+Omitting `key` defaults to `""` — backward-compatible with single-schedule usage.
+
 ### Unscheduling
 
 ```python

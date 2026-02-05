@@ -38,7 +38,17 @@ pq.schedule(heartbeat, run_every=timedelta(minutes=5))
 # Run at 9am on Mondays
 pq.schedule(heartbeat, cron="0 9 * * 1")
 
-# Remove schedule
+# Multiple schedules for the same function using key
+def sync_data(region: str) -> None:
+    print(f"Syncing {region}")
+
+pq.schedule(sync_data, run_every=timedelta(hours=1), key="us", region="us")
+pq.schedule(sync_data, run_every=timedelta(hours=2), key="eu", region="eu")
+
+# Remove only one schedule
+pq.unschedule(sync_data, key="us")
+
+# Remove default (no key) schedule
 pq.unschedule(heartbeat)
 ```
 
