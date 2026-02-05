@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 PYPROJECT = Path(__file__).parent.parent / "pyproject.toml"
+INIT_PY = Path(__file__).parent.parent / "src" / "pq" / "__init__.py"
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 BUMP_TYPES = {"patch", "minor", "major"}
 
@@ -40,7 +41,7 @@ def get_current_version() -> str:
 
 
 def set_version(new_version: str) -> None:
-    """Update version in pyproject.toml."""
+    """Update version in pyproject.toml and src/pq/__init__.py."""
     content = PYPROJECT.read_text()
     new_content = re.sub(
         r'^(version\s*=\s*)"[^"]+"',
@@ -50,6 +51,16 @@ def set_version(new_version: str) -> None:
         flags=re.MULTILINE,
     )
     PYPROJECT.write_text(new_content)
+
+    init_content = INIT_PY.read_text()
+    new_init_content = re.sub(
+        r'^(__version__\s*=\s*)"[^"]+"',
+        f'\\1"{new_version}"',
+        init_content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    INIT_PY.write_text(new_init_content)
 
 
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -104,10 +115,10 @@ def main() -> int:
 
     # Update pyproject.toml
     set_version(new_version)
-    print(f"Updated pyproject.toml: {current_version} -> {new_version}")
+    print(f"Updated version: {current_version} -> {new_version}")
 
     # Commit (skip if no changes, e.g. same version with --force)
-    run(["git", "add", str(PYPROJECT)])
+    run(["git", "add", str(PYPROJECT), str(INIT_PY)])
     diff = run(["git", "diff", "--cached", "--quiet"], check=False)
     if diff.returncode != 0:
         run(["git", "commit", "-m", f"Release {new_version}"])

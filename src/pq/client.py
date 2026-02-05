@@ -235,6 +235,7 @@ class PQ:
         cron: str | croniter | None = None,
         priority: Priority = Priority.NORMAL,
         client_id: str | None = None,
+        max_concurrent: int | None = 1,
         **kwargs: Any,
     ) -> int:
         """Schedule a periodic task.
@@ -249,6 +250,9 @@ class PQ:
             cron: Cron expression string (e.g., "0 9 * * 1") or croniter object.
             priority: Task priority. Higher = higher priority. Defaults to NORMAL.
             client_id: Optional client-provided identifier. Must be unique if provided.
+            max_concurrent: Maximum concurrent executions. Default 1 (no overlap).
+                Set to None for unlimited concurrency. Values > 1 are reserved
+                for future use and raise ValueError.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
@@ -257,6 +261,7 @@ class PQ:
         Raises:
             ValueError: If neither run_every nor cron is provided, or if both are.
             ValueError: If cron expression is invalid.
+            ValueError: If max_concurrent is greater than 1.
             ValueError: If task is a lambda, closure, or cannot be imported.
             IntegrityError: If client_id already exists.
         """
@@ -264,6 +269,11 @@ class PQ:
             raise ValueError("Either run_every or cron must be provided")
         if run_every is not None and cron is not None:
             raise ValueError("Only one of run_every or cron can be provided")
+        if max_concurrent is not None and max_concurrent > 1:
+            raise ValueError(
+                f"max_concurrent must be 1 or None, got {max_concurrent} "
+                "(values > 1 reserved for future use)"
+            )
 
         # Validate and normalize cron expression
         cron_expr: str | None = None
@@ -301,6 +311,7 @@ class PQ:
                     cron=cron_expr,
                     next_run=next_run,
                     client_id=client_id,
+                    max_concurrent=max_concurrent,
                 )
                 .on_conflict_do_update(
                     index_elements=["name"],
@@ -310,6 +321,7 @@ class PQ:
                         "run_every": run_every,
                         "cron": cron_expr,
                         "next_run": next_run,
+                        "max_concurrent": max_concurrent,
                     },
                 )
                 .returning(Periodic.id)

@@ -361,6 +361,104 @@ class TestPeriodicTasks:
         assert len(count) == 1
 
 
+class TestMaxConcurrent:
+    """Tests for max_concurrent periodic task behavior."""
+
+    def test_max_concurrent_skips_while_locked(self, pq: PQ) -> None:
+        """Periodic task with max_concurrent=1 is skipped while locked."""
+        from sqlalchemy import update
+
+        pq.schedule(periodic_noop_handler, run_every=timedelta(seconds=0))
+
+        # Manually set locked_until to the future
+        with pq.session() as session:
+            session.execute(
+                update(Periodic)
+                .where(Periodic.name == "tests.test_worker:periodic_noop_handler")
+                .values(locked_until=datetime.now(UTC) + timedelta(hours=1))
+            )
+
+        # Worker should skip since task is locked
+        processed = pq.run_worker_once()
+        assert processed is False
+
+    def test_max_concurrent_runs_after_lock_expires(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Periodic task runs after lock has expired."""
+        from sqlalchemy import update
+
+        results = manager.list()
+        _set_shared_results(results)
+
+        pq.schedule(counter_handler, run_every=timedelta(seconds=0))
+
+        # Set locked_until to the past (expired lock)
+        with pq.session() as session:
+            session.execute(
+                update(Periodic)
+                .where(Periodic.name == "tests.test_worker:counter_handler")
+                .values(locked_until=datetime.now(UTC) - timedelta(seconds=1))
+            )
+
+        processed = pq.run_worker_once()
+        assert processed is True
+        assert len(results) == 1
+
+    def test_max_concurrent_clears_lock_on_success(self, pq: PQ) -> None:
+        """Lock is cleared after successful task execution."""
+        from sqlalchemy import select
+
+        pq.schedule(periodic_noop_handler, run_every=timedelta(hours=1))
+
+        pq.run_worker_once()
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_worker:periodic_noop_handler"
+                )
+            ).scalar_one()
+            assert periodic.locked_until is None
+
+    def test_max_concurrent_clears_lock_on_failure(self, pq: PQ) -> None:
+        """Lock is cleared even after task failure."""
+        from sqlalchemy import select
+
+        pq.schedule(failing_handler, run_every=timedelta(hours=1))
+
+        pq.run_worker_once()
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_worker:failing_handler"
+                )
+            ).scalar_one()
+            assert periodic.locked_until is None
+
+    def test_max_concurrent_none_allows_overlap(self, pq: PQ) -> None:
+        """max_concurrent=None does not set a lock."""
+        from sqlalchemy import select
+
+        pq.schedule(
+            periodic_noop_handler,
+            run_every=timedelta(seconds=0),
+            max_concurrent=None,
+        )
+
+        pq.run_worker_once()
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_worker:periodic_noop_handler"
+                )
+            ).scalar_one()
+            # locked_until should remain None (no lock set)
+            assert periodic.locked_until is None
+
+
 class TestAsyncTasks:
     """Tests for async task handler support."""
 
