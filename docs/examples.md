@@ -52,6 +52,29 @@ pq.unschedule(sync_data, key="us")
 pq.unschedule(heartbeat)
 ```
 
+## Pausing & Resuming Periodic Tasks
+
+Disable a periodic task without removing it, then re-enable it later:
+
+```python
+from datetime import timedelta
+from pq import PQ
+
+pq = PQ("postgresql://localhost/mydb")
+
+def sync_inventory() -> None:
+    print("syncing...")
+
+# Schedule as usual (active by default)
+pq.schedule(sync_inventory, run_every=timedelta(minutes=5))
+
+# Pause - keeps the schedule but the worker won't run it
+pq.schedule(sync_inventory, run_every=timedelta(minutes=5), active=False)
+
+# Resume
+pq.schedule(sync_inventory, run_every=timedelta(minutes=5), active=True)
+```
+
 ## Priority Queues
 
 [`examples/priority.py`](https://github.com/ricwo/pq/blob/main/examples/priority.py) - Task prioritization.

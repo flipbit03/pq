@@ -361,6 +361,44 @@ class TestPeriodicTasks:
         assert len(count) == 1
 
 
+class TestActiveFlag:
+    """Tests for active flag on periodic tasks."""
+
+    def test_inactive_periodic_not_executed(self, pq: PQ) -> None:
+        """Worker skips inactive periodic tasks."""
+        pq.schedule(periodic_noop_handler, run_every=timedelta(seconds=0), active=False)
+
+        processed = pq.run_worker_once()
+        assert processed is False
+
+    def test_active_periodic_executed(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Worker executes active periodic tasks normally."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        pq.schedule(counter_handler, run_every=timedelta(seconds=0), active=True)
+
+        processed = pq.run_worker_once()
+        assert processed is True
+        assert len(results) == 1
+
+    def test_reactivated_periodic_executed(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Worker executes a periodic task after re-activation."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        pq.schedule(counter_handler, run_every=timedelta(seconds=0), active=False)
+        assert pq.run_worker_once() is False
+
+        pq.schedule(counter_handler, run_every=timedelta(seconds=0), active=True)
+        assert pq.run_worker_once() is True
+        assert len(results) == 1
+
+
 class TestMaxConcurrent:
     """Tests for max_concurrent periodic task behavior."""
 

@@ -70,6 +70,7 @@ pq.schedule(cleanup, run_every=timedelta(hours=1))
 | `priority` | 0-100, higher runs first |
 | `run_every` | Interval (e.g., 1 hour) |
 | `cron` | Cron expression (e.g., `0 9 * * 1`) |
+| `active` | Whether the task is executed (default `true`) |
 | `next_run` | Next scheduled execution |
 
 ## Fork Isolation

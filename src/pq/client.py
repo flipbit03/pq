@@ -237,6 +237,7 @@ class PQ:
         client_id: str | None = None,
         max_concurrent: int | None = 1,
         key: str = "",
+        active: bool = True,
         **kwargs: Any,
     ) -> int:
         """Schedule a periodic task.
@@ -256,6 +257,8 @@ class PQ:
                 for future use and raise ValueError.
             key: Discriminator for multiple schedules of the same function.
                 Defaults to "" (empty string).
+            active: Whether the task is active. Inactive tasks are not executed.
+                Defaults to True.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
@@ -316,6 +319,7 @@ class PQ:
                     next_run=next_run,
                     client_id=client_id,
                     max_concurrent=max_concurrent,
+                    active=active,
                 )
                 .on_conflict_do_update(
                     index_elements=["name", "key"],
@@ -326,6 +330,7 @@ class PQ:
                         "cron": cron_expr,
                         "next_run": next_run,
                         "max_concurrent": max_concurrent,
+                        "active": active,
                     },
                 )
                 .returning(Periodic.id)

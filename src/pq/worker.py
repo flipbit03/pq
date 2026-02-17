@@ -560,6 +560,7 @@ def _process_periodic_task(
             # Claim highest priority due periodic task with FOR UPDATE SKIP LOCKED
             # Filter out tasks that are locked (max_concurrent=1 and locked_until in future)
             stmt = select(Periodic).where(
+                Periodic.active.is_(True),
                 Periodic.next_run <= func.now(),
                 or_(
                     Periodic.max_concurrent.is_(None),

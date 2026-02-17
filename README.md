@@ -145,6 +145,20 @@ pq.schedule(fast_idempotent_task, run_every=timedelta(seconds=30), max_concurren
 
 The lock auto-expires after `max_runtime` seconds (or 1 hour by default) for crash safety.
 
+### Pausing & Resuming
+
+Disable a periodic task without removing it:
+
+```python
+# Pause - task stays in the database but won't run
+pq.schedule(sync_inventory, run_every=timedelta(minutes=5), active=False)
+
+# Resume
+pq.schedule(sync_inventory, run_every=timedelta(minutes=5), active=True)
+```
+
+New schedules are active by default.
+
 ### Multiple Schedules (Key)
 
 Use `key` to register the same function multiple times with different configurations:
