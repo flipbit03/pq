@@ -232,6 +232,72 @@ class TestScheduleMaxConcurrent:
             assert periodic.max_concurrent == 1
 
 
+class TestScheduleActive:
+    """Tests for active parameter in schedule."""
+
+    def test_schedule_active_defaults_true(self, pq: PQ) -> None:
+        """Schedule stores active=True by default."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.active is True
+
+    def test_schedule_active_false(self, pq: PQ) -> None:
+        """Schedule stores active=False when explicitly set."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), active=False)
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.active is False
+
+    def test_schedule_upserts_active(self, pq: PQ) -> None:
+        """Schedule upsert updates active flag."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), active=True)
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), active=False)
+
+        assert pq.periodic_count() == 1
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.active is False
+
+    def test_schedule_upserts_active_reactivate(self, pq: PQ) -> None:
+        """Schedule upsert can re-enable an inactive task."""
+        from sqlalchemy import select
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), active=False)
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), active=True)
+
+        assert pq.periodic_count() == 1
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(
+                    Periodic.name == "tests.test_client:cleanup_handler"
+                )
+            ).scalar_one()
+            assert periodic.active is True
+
+
 class TestPeriodicKey:
     """Tests for periodic task key discriminator."""
 
