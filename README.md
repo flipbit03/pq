@@ -24,6 +24,12 @@ pq.run_worker()
 ## Install
 
 ```bash
+uv add python-pq
+```
+
+Or with pip:
+
+```bash
 pip install python-pq
 ```
 
