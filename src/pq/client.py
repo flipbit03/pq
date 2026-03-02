@@ -352,17 +352,19 @@ class PQ:
             result = session.execute(stmt)
             return result.rowcount > 0
 
-    def unschedule(self, task: Callable[..., Any], *, key: str = "") -> bool:
+    def unschedule(self, task: Callable[..., Any] | str, *, key: str = "") -> bool:
         """Remove a periodic task.
 
         Args:
-            task: The scheduled function to remove.
+            task: The scheduled function to remove, or its import path
+                as a 'module:name' string (useful when the module has
+                been removed and the callable is no longer importable).
             key: Discriminator key. Defaults to "" (the default schedule).
 
         Returns:
             True if task was found and deleted, False otherwise.
         """
-        name = get_function_path(task)
+        name = task if isinstance(task, str) else get_function_path(task)
         with self.session() as session:
             stmt = delete(Periodic).where(Periodic.name == name, Periodic.key == key)
             result = session.execute(stmt)

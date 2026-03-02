@@ -394,6 +394,21 @@ class TestUnschedule:
         assert result is True
         assert pq.periodic_count() == 0
 
+    def test_unschedule_by_name_string(self, pq: PQ) -> None:
+        """Unschedule accepts a 'module:name' string for tasks whose module no longer exists."""
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+        assert pq.periodic_count() == 1
+
+        result = pq.unschedule("tests.test_client:cleanup_handler")
+
+        assert result is True
+        assert pq.periodic_count() == 0
+
+    def test_unschedule_by_name_string_nonexistent_returns_false(self, pq: PQ) -> None:
+        """Unschedule with a string returns False when no matching task exists."""
+        result = pq.unschedule("no.such.module:gone_function")
+        assert result is False
+
     def test_unschedule_nonexistent_returns_false(self, pq: PQ) -> None:
         """Unschedule returns False for nonexistent function."""
         result = pq.unschedule(dummy_handler)
