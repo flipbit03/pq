@@ -98,6 +98,10 @@ Use **Pydantic** models wherever possible:
 - `migrations/` - Alembic database migrations
 - `main.py` - Entry point
 
+## Releases & Versioning
+
+Do **not** bump the version in PRs. Releases are handled by the maintainer on `main` via `make release-patch/minor/major` (see `RELEASE.md` for full process).
+
 ### Migration Column Ordering
 
 When creating migrations, order columns as follows:
