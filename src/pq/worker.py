@@ -75,6 +75,14 @@ DEFAULT_RETENTION_DAYS: int = 7
 # Default cleanup interval: 1 hour
 DEFAULT_CLEANUP_INTERVAL: float = 3600
 
+# Default stale task timeout: 1 hour
+# Tasks RUNNING longer than this are assumed orphaned (worker died) and reaped.
+DEFAULT_STALE_TASK_TIMEOUT: timedelta = timedelta(hours=1)
+
+# Default reaper check interval: 5 minutes
+# How often the worker checks for stale RUNNING tasks.
+DEFAULT_REAPER_INTERVAL: float = 300
+
 # Exit codes for child process
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -377,6 +385,35 @@ def _maybe_run_cleanup(
     last_cleanup[0] = now
 
 
+def _maybe_reap_stale(
+    pq: PQ,
+    stale_task_timeout: timedelta | None,
+    reaper_interval: float,
+    last_reap: list[float],
+) -> None:
+    """Reap stale RUNNING tasks if enabled and interval has passed.
+
+    Args:
+        pq: PQ client instance.
+        stale_task_timeout: RUNNING tasks older than this are marked FAILED.
+            ``None`` disables reaping.
+        reaper_interval: Seconds between reaper checks.
+        last_reap: Mutable list containing last reap timestamp.
+    """
+    if stale_task_timeout is None:
+        return
+
+    now = time.time()
+    if now - last_reap[0] < reaper_interval:
+        return
+
+    reaped = pq.reap_stale_tasks(stale_task_timeout)
+    if reaped:
+        logger.info(f"Reaped {reaped} stale RUNNING task(s)")
+
+    last_reap[0] = now
+
+
 def run_worker(
     pq: PQ,
     *,
@@ -386,6 +423,7 @@ def run_worker(
     priorities: Set[Priority] | None = None,
     retention_days: int = DEFAULT_RETENTION_DAYS,
     cleanup_interval: float = DEFAULT_CLEANUP_INTERVAL,
+    stale_task_timeout: timedelta | None = DEFAULT_STALE_TASK_TIMEOUT,
     pre_execute: PreExecuteHook | None = None,
     post_execute: PostExecuteHook | None = None,
 ) -> None:
@@ -404,6 +442,9 @@ def run_worker(
         retention_days: Days to keep completed/failed tasks. Default: 7.
             Set to 0 to disable automatic cleanup.
         cleanup_interval: Seconds between cleanup runs. Default: 3600 (1 hour).
+        stale_task_timeout: Mark RUNNING tasks older than this as FAILED.
+            Catches orphaned tasks whose worker died mid-execution.
+            Default: 1 hour. Set to ``None`` to disable.
         pre_execute: Called in forked child BEFORE task execution.
             Use for initializing fork-unsafe resources (OTel, DB connections).
         post_execute: Called in forked child AFTER task execution (success or failure).
@@ -432,10 +473,12 @@ def run_worker(
             post_execute=post_execute,
             retention_days=retention_days,
             cleanup_interval=cleanup_interval,
+            stale_task_timeout=stale_task_timeout,
         )
         return
 
-    last_cleanup: list[float] = [0.0]  # Mutable container for tracking
+    last_cleanup: list[float] = [0.0]
+    last_reap: list[float] = [0.0]
 
     try:
         while True:
@@ -447,6 +490,9 @@ def run_worker(
                 post_execute=post_execute,
             ):
                 _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
+                _maybe_reap_stale(
+                    pq, stale_task_timeout, DEFAULT_REAPER_INTERVAL, last_reap
+                )
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Worker stopped.")
@@ -595,15 +641,26 @@ def _process_one_off_task(
 
     elapsed = time.perf_counter() - start
 
-    # Phase 3: Update task status
+    # Phase 3: Update task status (guarded — only if still RUNNING, so we
+    # don't overwrite a reaper's FAILED verdict for an orphaned task)
     try:
         with pq.session() as session:
-            task = session.get(Task, task_id)
-            if task:
-                task.status = status
-                task.completed_at = datetime.now(UTC)
-                if error_msg:
-                    task.error = error_msg
+            values: dict[str, object] = {
+                "status": status,
+                "completed_at": datetime.now(UTC),
+            }
+            if error_msg:
+                values["error"] = error_msg
+            result = session.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.status == TaskStatus.RUNNING)
+                .values(**values)
+            )
+            if result.rowcount == 0:
+                logger.warning(
+                    f"Task '{name}' (id={task_id}) was no longer RUNNING"
+                    " when Phase 3 tried to update — likely reaped"
+                )
     except Exception as e:
         logger.error(f"Error updating task status: {e}")
 
@@ -1016,12 +1073,25 @@ def _reap_and_update(pq: PQ, slot: _ChildSlot) -> None:
 
         try:
             with pq.session() as session:
-                task = session.get(Task, slot.task_id)
-                if task:
-                    task.status = result.task_status
-                    task.completed_at = datetime.now(UTC)
-                    if error_msg:
-                        task.error = error_msg
+                values: dict[str, object] = {
+                    "status": result.task_status,
+                    "completed_at": datetime.now(UTC),
+                }
+                if error_msg:
+                    values["error"] = error_msg
+                row_result = session.execute(
+                    update(Task)
+                    .where(
+                        Task.id == slot.task_id,
+                        Task.status == TaskStatus.RUNNING,
+                    )
+                    .values(**values)
+                )
+                if row_result.rowcount == 0:
+                    logger.warning(
+                        f"Task '{slot.name}' (id={slot.task_id}) was no longer"
+                        " RUNNING when reap tried to update — likely reaped"
+                    )
         except Exception as e:
             logger.error(f"Error updating task status: {e}")
 
@@ -1044,6 +1114,7 @@ def _run_concurrent(
     post_execute: PostExecuteHook | None,
     retention_days: int,
     cleanup_interval: float,
+    stale_task_timeout: timedelta | None = None,
 ) -> None:
     """Run the concurrent worker loop.
 
@@ -1060,10 +1131,12 @@ def _run_concurrent(
         post_execute: Called in forked child AFTER task execution.
         retention_days: Days to keep completed/failed tasks.
         cleanup_interval: Seconds between cleanup runs.
+        stale_task_timeout: If set, reap RUNNING tasks older than this.
     """
     children: dict[int, _ChildSlot] = {}  # pid -> slot
     fd_to_pid: dict[int, int] = {}  # read_fd -> pid
     last_cleanup: list[float] = [0.0]
+    last_reap: list[float] = [0.0]
 
     try:
         while True:
@@ -1092,8 +1165,11 @@ def _run_concurrent(
             else:
                 time.sleep(poll_interval)
 
-            # Cleanup runs on every iteration (rate-limited internally)
+            # Maintenance (each rate-limited independently)
             _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
+            _maybe_reap_stale(
+                pq, stale_task_timeout, DEFAULT_REAPER_INTERVAL, last_reap
+            )
 
     except KeyboardInterrupt:
         if children:

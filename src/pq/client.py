@@ -9,7 +9,8 @@ from typing import Any, Self
 
 from croniter import croniter
 from croniter.croniter import CroniterBadCronError
-from sqlalchemy import create_engine, delete, func, select
+from loguru import logger
+from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
@@ -506,6 +507,50 @@ class PQ:
                 stmt = stmt.where(Task.completed_at < before)
             result = session.execute(stmt)
             return result.rowcount
+
+    def reap_stale_tasks(self, threshold: timedelta) -> int:
+        """Mark stale RUNNING tasks as FAILED.
+
+        When a worker dies mid-execution (e.g. pod restart, OOM on the worker
+        process), in-flight tasks stay RUNNING forever because no parent
+        process remains to update their status. This method detects those
+        orphaned rows and transitions them to FAILED.
+
+        Args:
+            threshold: A task is considered stale when
+                ``started_at + threshold < now()``. Should be at least
+                2x ``max_runtime`` to avoid reaping legitimately running
+                tasks, e.g. ``timedelta(seconds=max_runtime * 2)``.
+
+        Returns:
+            Number of tasks reaped.
+        """
+        now = datetime.now(UTC)
+        cutoff = now - threshold
+        with self.session() as session:
+            stmt = (
+                update(Task)
+                .where(
+                    Task.status == TaskStatus.RUNNING,
+                    Task.started_at < cutoff,
+                )
+                .values(
+                    status=TaskStatus.FAILED,
+                    completed_at=now,
+                    error=(
+                        f"Reaped: task still RUNNING after {threshold} "
+                        f"(cutoff={cutoff.isoformat()}). Worker likely died."
+                    ),
+                )
+                .returning(Task.id, Task.name, Task.started_at)
+            )
+            reaped = list(session.execute(stmt).all())
+            for task_id, name, started_at in reaped:
+                logger.warning(
+                    f"Reaped stale task '{name}' (id={task_id},"
+                    f" started_at={started_at})"
+                )
+            return len(reaped)
 
     def run_worker(
         self,

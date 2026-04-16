@@ -656,3 +656,126 @@ class TestUpsert:
         task_id = pq.upsert(dummy_handler, client_id="int-test")
         assert isinstance(task_id, int)
         assert task_id > 0
+
+
+class TestReapStaleTasks:
+    """Tests for reap_stale_tasks method."""
+
+    def test_reaps_stale_running_task(self, pq: PQ) -> None:
+        """RUNNING task older than threshold is reaped to FAILED."""
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        task_id = pq.enqueue(dummy_handler, client_id="stale-1")
+
+        # Simulate: worker claimed it and then died
+        with pq.session() as session:
+            session.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status=TaskStatus.RUNNING,
+                    started_at=datetime.now(UTC) - timedelta(hours=2),
+                )
+            )
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+
+        assert reaped == 1
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert task.completed_at is not None
+        assert "Reaped" in (task.error or "")
+        assert "Worker likely died" in (task.error or "")
+
+    def test_does_not_reap_recent_running_task(self, pq: PQ) -> None:
+        """RUNNING task within threshold is not reaped."""
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        task_id = pq.enqueue(dummy_handler, client_id="recent-1")
+
+        # Simulate: worker claimed it 5 min ago (still within 1h threshold)
+        with pq.session() as session:
+            session.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status=TaskStatus.RUNNING,
+                    started_at=datetime.now(UTC) - timedelta(minutes=5),
+                )
+            )
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+
+        assert reaped == 0
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+
+    def test_does_not_reap_non_running_tasks(self, pq: PQ) -> None:
+        """Only RUNNING tasks are reaped — PENDING, COMPLETED, and FAILED are untouched."""
+        from sqlalchemy import update as sa_update
+
+        from pq.models import TaskStatus
+
+        # PENDING
+        pq.enqueue(dummy_handler, client_id="task-pending")
+
+        # COMPLETED (enqueue + process)
+        pq.enqueue(dummy_handler, client_id="task-completed")
+        pq.run_worker_once()
+
+        # FAILED (manually set — simulates a previously failed task)
+        failed_id = pq.enqueue(dummy_handler, client_id="task-failed")
+        with pq.session() as session:
+            session.execute(
+                sa_update(Task)
+                .where(Task.id == failed_id)
+                .values(
+                    status=TaskStatus.FAILED,
+                    started_at=datetime.now(UTC) - timedelta(hours=2),
+                    completed_at=datetime.now(UTC) - timedelta(hours=2),
+                    error="original failure",
+                )
+            )
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+
+        assert reaped == 0
+
+    def test_reaps_multiple_stale_tasks(self, pq: PQ) -> None:
+        """Multiple stale tasks are reaped in a single call."""
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        stale_started = datetime.now(UTC) - timedelta(hours=3)
+        for i in range(5):
+            task_id = pq.enqueue(dummy_handler, client_id=f"multi-stale-{i}")
+            with pq.session() as session:
+                session.execute(
+                    update(Task)
+                    .where(Task.id == task_id)
+                    .values(
+                        status=TaskStatus.RUNNING,
+                        started_at=stale_started,
+                    )
+                )
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+
+        assert reaped == 5
+        failed = pq.list_failed()
+        assert len(failed) == 5
+
+    def test_returns_zero_when_no_stale_tasks(self, pq: PQ) -> None:
+        """Returns 0 when there are no stale tasks."""
+        pq.enqueue(dummy_handler)  # PENDING, not RUNNING
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+
+        assert reaped == 0
