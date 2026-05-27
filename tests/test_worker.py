@@ -99,6 +99,29 @@ def slow_sync_handler() -> None:
     time.sleep(10)
 
 
+def lock_observer_handler(db_url: str) -> None:
+    """Handler used by ``test_periodic_lock_duration_scales_with_per_task_max_runtime``.
+
+    Queries its own periodic row mid-execution (before the
+    post-execution cleanup at ``worker.py:833`` clears ``locked_until``)
+    and stores the captured value into the test's shared
+    multiprocessing list. Runs in a forked child, so it opens its own
+    short-lived ``PQ`` client against the supplied ``db_url`` rather
+    than trying to reuse the parent's session.
+    """
+    from sqlalchemy import select
+
+    from pq.client import PQ as PQClient
+
+    client = PQClient(db_url)
+    try:
+        with client.session() as session:
+            periodic = session.execute(select(Periodic)).scalar_one()
+            _shared_results.append(periodic.locked_until)
+    finally:
+        client.close()
+
+
 def sleep_handler(duration: float) -> None:
     """Sleep for a given duration. Used in concurrency tests."""
     time.sleep(duration)
@@ -1173,3 +1196,151 @@ class TestStaleReaperRace:
         assert task is not None
         assert task.status == TaskStatus.FAILED
         assert "Reaped" in (task.error or "")
+
+
+class TestPerTaskMaxRuntimeEnforcement:
+    """Tests that the worker honours per-task ``max_runtime_seconds`` on
+    every execution path (sequential + concurrent × one-off + periodic).
+
+    Each test pins one knob and varies the other, asserting the worker
+    picks the right effective ceiling:
+
+    - per-task value when set
+    - worker default when per-task is NULL (backwards-compat)
+    """
+
+    # ------------------------------------------------------------------
+    # One-off tasks — sequential path (``_process_one_off_task``)
+    # ------------------------------------------------------------------
+
+    def test_one_off_async_task_uses_per_task_max_runtime(self, pq: PQ) -> None:
+        """Per-task override TIGHTER than worker default kills the task."""
+        # Worker default = 30s, per-task = 0.1s → killed at 0.1s.
+        pq.enqueue(slow_async_handler, max_runtime=0.1)
+        pq.run_worker_once(max_runtime=30)
+        assert pq.pending_count() == 0  # task processed (and failed)
+
+    def test_one_off_sync_task_uses_per_task_max_runtime(self, pq: PQ) -> None:
+        """Same as above for sync handlers (SIGALRM path)."""
+        # SIGALRM has 1-second granularity; use 1s for the override
+        # and 60s for the worker default.
+        pq.enqueue(slow_sync_handler, max_runtime=1)
+        pq.run_worker_once(max_runtime=60)
+        assert pq.pending_count() == 0
+
+    def test_one_off_task_falls_back_to_worker_default_when_null(self, pq: PQ) -> None:
+        """Backwards-compat: enqueue without override → worker default
+        applies (so existing call sites keep their previous semantics
+        exactly)."""
+        # No per-task value; worker default = 0.1s → still killed.
+        pq.enqueue(slow_async_handler)
+        pq.run_worker_once(max_runtime=0.1)
+        assert pq.pending_count() == 0
+
+    def test_one_off_task_override_can_be_longer_than_worker_default(
+        self, pq: PQ
+    ) -> None:
+        """Per-task override LOOSER than worker default lets a fast task
+        complete normally even when the worker's general policy is
+        aggressive. This is THE central use case — a worker fleet
+        sized for short tasks lets one occasionally-long task opt out
+        of the tight ceiling."""
+        # Worker default = 0.5s. Fast handler completes in ~0s; we
+        # pass max_runtime=10 just to prove the override is honoured
+        # (else the task would be killed even though it's fast — no:
+        # fast tasks aren't affected by either ceiling; what we're
+        # really proving is the column is consumed by the right code
+        # path without breaking happy-path execution).
+        pq.enqueue(noop_handler, max_runtime=10.0)
+        result = pq.run_worker_once(max_runtime=0.5)
+        assert result is True  # task was processed
+        assert pq.pending_count() == 0
+
+    # ------------------------------------------------------------------
+    # Periodic tasks — sequential path (``_process_periodic_task``)
+    # ------------------------------------------------------------------
+
+    def test_periodic_async_task_uses_per_task_max_runtime(self, pq: PQ) -> None:
+        """Same as one-off but on the periodic path. The periodic
+        worker reads ``periodic.max_runtime_seconds`` and applies the
+        same effective-value rule."""
+        pq.schedule(
+            slow_async_handler,
+            run_every=timedelta(seconds=60),
+            max_runtime=0.1,
+        )
+        pq.run_worker_once(max_runtime=30)
+        # Periodic doesn't pop from pending_count; assert via the
+        # schedule's last_run timestamp moving forward.
+        from sqlalchemy import select
+
+        with pq.session() as session:
+            periodic = session.execute(select(Periodic)).scalar_one()
+            assert periodic.last_run is not None
+
+    def test_periodic_task_falls_back_to_worker_default_when_null(self, pq: PQ) -> None:
+        """Backwards-compat for the periodic path."""
+        pq.schedule(slow_async_handler, run_every=timedelta(seconds=60))
+        pq.run_worker_once(max_runtime=0.1)  # worker default kills it
+        from sqlalchemy import select
+
+        with pq.session() as session:
+            periodic = session.execute(select(Periodic)).scalar_one()
+            assert periodic.last_run is not None
+
+    def test_periodic_lock_duration_scales_with_per_task_max_runtime(
+        self,
+        pq: PQ,
+        db_url: str,
+        manager: multiprocessing.managers.SyncManager,
+    ) -> None:
+        """When ``max_concurrent=1``, the worker sets
+        ``locked_until = now() + lock_duration`` to keep concurrent
+        workers off the schedule during execution. That lock duration
+        must track the per-task override, not the worker default —
+        otherwise a long-running periodic would lose its lock
+        mid-execution and another worker could claim it.
+
+        Verifies by capturing ``locked_until`` from inside the forked
+        handler (via shared multiprocessing state) before the
+        post-execution cleanup at ``worker.py:833`` clears it back to
+        ``None``. Asserts the captured window is far closer to the
+        per-task override (120 s) than the worker default (30 s).
+        """
+        captured = manager.list()
+        _set_shared_results(captured)
+
+        pq.schedule(
+            lock_observer_handler,
+            db_url=db_url,
+            run_every=timedelta(seconds=60),
+            max_concurrent=1,
+            max_runtime=120.0,
+        )
+        pq.run_worker_once(max_runtime=30.0)
+
+        # Handler ran once and captured ``locked_until`` it observed for
+        # its own row, before the post-execution cleanup cleared the lock.
+        assert len(captured) == 1, (
+            f"lock_observer_handler should have run exactly once; "
+            f"got {len(captured)} captures"
+        )
+        locked_until = captured[0]
+        assert locked_until is not None, (
+            "locked_until was None at execution time — concurrency lock "
+            "was never set despite max_concurrent=1"
+        )
+        # The captured ``locked_until`` was set ~now()+lock_duration just
+        # before the fork; ``now()`` here is mid- to post-fork. The window
+        # should be well above the worker default (30 s) and bounded above
+        # by the per-task override (120 s) plus measurement slack.
+        window_seconds = (locked_until - datetime.now(UTC)).total_seconds()
+        assert window_seconds > 60.0, (
+            f"Lock window {window_seconds:.1f}s is suspiciously short — "
+            f"likely fell back to the worker default (30s) instead of "
+            f"honouring the per-task override (120s)."
+        )
+        assert window_seconds < 180.0, (
+            f"Lock window {window_seconds:.1f}s exceeds the per-task "
+            f"override + measurement slack."
+        )

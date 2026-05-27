@@ -596,6 +596,10 @@ def _process_one_off_task(
             name = task.name
             payload = task.payload
             task_id = task.id
+            # Per-task ``max_runtime_seconds`` (NULL → use worker default).
+            # Read while still in the session because the row is expunged
+            # below for the forked-child handoff.
+            task_max_runtime = task.max_runtime_seconds
 
             # Flush to commit status changes, then expunge for forked process
             session.flush()
@@ -604,6 +608,14 @@ def _process_one_off_task(
     except Exception as e:
         logger.error(f"Error claiming task: {e}")
         return False
+
+    # Effective per-task wall-clock ceiling: per-task value when set,
+    # otherwise the worker's configured default. The reaper applies the
+    # same rule on its own (see ``Client.reap_stale_tasks``), so the
+    # two stay in sync without the worker having to coordinate.
+    effective_max_runtime = (
+        task_max_runtime if task_max_runtime is not None else max_runtime
+    )
 
     # Phase 2: Execute handler in forked process
     start = time.perf_counter()
@@ -617,7 +629,7 @@ def _process_one_off_task(
             handler,
             args,
             kwargs,
-            max_runtime=max_runtime,
+            max_runtime=effective_max_runtime,
             task=task,
             pre_execute=pre_execute,
             post_execute=post_execute,
@@ -739,10 +751,27 @@ def _process_periodic_task(
             payload = periodic.payload
             periodic_id = periodic.id
             periodic_max_concurrent = periodic.max_concurrent
+            # Per-schedule ``max_runtime_seconds`` (NULL → use worker default).
+            # Read while still in the session because the row is expunged
+            # below for the forked-child handoff.
+            periodic_max_runtime = periodic.max_runtime_seconds
+
+            # Effective per-execution wall-clock ceiling: per-schedule value
+            # when set, otherwise the worker's configured default. Drives
+            # both the in-child timeout enforcement AND the
+            # ``locked_until`` window so the lock doesn't expire while a
+            # legitimately-long execution is still running.
+            effective_max_runtime = (
+                periodic_max_runtime
+                if periodic_max_runtime is not None
+                else max_runtime
+            )
 
             # Set lock before execution if concurrency is limited
             if periodic.max_concurrent is not None:
-                lock_duration = max_runtime if max_runtime > 0 else 3600
+                lock_duration = (
+                    effective_max_runtime if effective_max_runtime > 0 else 3600
+                )
                 periodic.locked_until = func.now() + timedelta(seconds=lock_duration)
 
             # Advance schedule BEFORE execution
@@ -769,7 +798,7 @@ def _process_periodic_task(
             handler,
             args,
             kwargs,
-            max_runtime=max_runtime,
+            max_runtime=effective_max_runtime,
             task=periodic,
             pre_execute=pre_execute,
             post_execute=post_execute,
@@ -851,6 +880,9 @@ def _claim_and_fork_one_off(
             name = task.name
             payload = task.payload
             task_id = task.id
+            # Per-task ``max_runtime_seconds`` (NULL → use worker default).
+            # Same handling as the sequential ``_process_one_off_task`` path.
+            task_max_runtime = task.max_runtime_seconds
 
             session.flush()
             session.expunge(task)
@@ -859,6 +891,10 @@ def _claim_and_fork_one_off(
         logger.error(f"Error claiming task: {e}")
         return None
 
+    effective_max_runtime = (
+        task_max_runtime if task_max_runtime is not None else max_runtime
+    )
+
     try:
         handler = resolve_function_path(name)
         args, kwargs = deserialize(payload)
@@ -866,7 +902,7 @@ def _claim_and_fork_one_off(
             handler,
             args,
             kwargs,
-            max_runtime=max_runtime,
+            max_runtime=effective_max_runtime,
             task=task,
             pre_execute=pre_execute,
             post_execute=post_execute,
@@ -934,9 +970,20 @@ def _claim_and_fork_periodic(
             payload = periodic.payload
             periodic_id = periodic.id
             periodic_max_concurrent = periodic.max_concurrent
+            # Per-schedule ``max_runtime_seconds`` (NULL → use worker default).
+            # Same handling as the sequential ``_process_periodic_task`` path.
+            periodic_max_runtime = periodic.max_runtime_seconds
+
+            effective_max_runtime = (
+                periodic_max_runtime
+                if periodic_max_runtime is not None
+                else max_runtime
+            )
 
             if periodic.max_concurrent is not None:
-                lock_duration = max_runtime if max_runtime > 0 else 3600
+                lock_duration = (
+                    effective_max_runtime if effective_max_runtime > 0 else 3600
+                )
                 periodic.locked_until = func.now() + timedelta(seconds=lock_duration)
 
             periodic.last_run = func.now()
@@ -959,7 +1006,7 @@ def _claim_and_fork_periodic(
             handler,
             args,
             kwargs,
-            max_runtime=max_runtime,
+            max_runtime=effective_max_runtime,
             task=periodic,
             pre_execute=pre_execute,
             post_execute=post_execute,

@@ -10,6 +10,7 @@ from typing import Any, Self
 from croniter import croniter
 from croniter.croniter import CroniterBadCronError
 from loguru import logger
+import sqlalchemy as sa
 from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
@@ -125,6 +126,7 @@ class PQ:
         run_at: datetime | None = None,
         priority: Priority = Priority.NORMAL,
         client_id: str | None = None,
+        max_runtime: float | None = None,
         **kwargs: Any,
     ) -> int:
         """Enqueue a one-off task.
@@ -135,6 +137,13 @@ class PQ:
             run_at: When to run the task. Defaults to now.
             priority: Task priority. Higher = higher priority. Defaults to NORMAL.
             client_id: Optional client-provided identifier. Must be unique if provided.
+            max_runtime: Per-task wall-clock cap in seconds. When ``None`` (the
+                common case), the worker that picks up this task uses its
+                configured default. When set, this specific task gets the
+                supplied ceiling AND the stale-reaper threshold scales with
+                it (``max_runtime * 2`` if larger than the reaper's global
+                default). Use this for occasionally-long tasks in a fleet
+                whose worker default is sized for typical short work.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
@@ -156,6 +165,7 @@ class PQ:
             run_at=run_at,
             priority=priority,
             client_id=client_id,
+            max_runtime_seconds=max_runtime,
         )
 
         with self.session() as session:
@@ -170,6 +180,7 @@ class PQ:
         run_at: datetime | None = None,
         priority: Priority = Priority.NORMAL,
         client_id: str,
+        max_runtime: float | None = None,
         **kwargs: Any,
     ) -> int:
         """Enqueue a task, updating if client_id already exists.
@@ -183,6 +194,9 @@ class PQ:
             run_at: When to run the task. Defaults to now.
             priority: Task priority. Higher = higher priority. Defaults to NORMAL.
             client_id: Client-provided identifier. Required for conflict resolution.
+            max_runtime: Per-task wall-clock cap in seconds. See ``enqueue`` for
+                details. ``None`` (the default) leaves the worker's own
+                configured ``max_runtime`` in effect.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
@@ -206,6 +220,7 @@ class PQ:
                 priority=priority,
                 status=TaskStatus.PENDING,
                 run_at=run_at,
+                max_runtime_seconds=max_runtime,
             )
             .on_conflict_do_update(
                 index_elements=["client_id"],
@@ -215,6 +230,7 @@ class PQ:
                     "priority": priority,
                     "status": TaskStatus.PENDING,
                     "run_at": run_at,
+                    "max_runtime_seconds": max_runtime,
                     "attempts": 0,
                     "started_at": None,
                     "completed_at": None,
@@ -239,6 +255,7 @@ class PQ:
         max_concurrent: int | None = 1,
         key: str = "",
         active: bool = True,
+        max_runtime: float | None = None,
         **kwargs: Any,
     ) -> int:
         """Schedule a periodic task.
@@ -260,6 +277,14 @@ class PQ:
                 Defaults to "" (empty string).
             active: Whether the task is active. Inactive tasks are not executed.
                 Defaults to True.
+            max_runtime: Per-execution wall-clock cap in seconds. When ``None``
+                (the common case), each execution uses the worker's configured
+                default. When set, this schedule's executions get the
+                supplied ceiling, and the ``locked_until`` window (used when
+                ``max_concurrent`` is in effect) is extended to match so the
+                lock doesn't expire while the execution is legitimately still
+                running. Periodic tasks are not subject to the stale-task
+                reaper, so this knob is purely about the wall-clock cap.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
@@ -321,6 +346,7 @@ class PQ:
                     client_id=client_id,
                     max_concurrent=max_concurrent,
                     active=active,
+                    max_runtime_seconds=max_runtime,
                 )
                 .on_conflict_do_update(
                     index_elements=["name", "key"],
@@ -332,6 +358,7 @@ class PQ:
                         "next_run": next_run,
                         "max_concurrent": max_concurrent,
                         "active": active,
+                        "max_runtime_seconds": max_runtime,
                     },
                 )
                 .returning(Periodic.id)
@@ -516,30 +543,59 @@ class PQ:
         process remains to update their status. This method detects those
         orphaned rows and transitions them to FAILED.
 
+        Tasks enqueued with a per-task ``max_runtime`` override get a
+        proportionally larger reaper window: the effective threshold for
+        a row is ``max(threshold, max_runtime_seconds * 2)``. This avoids
+        reaping a legitimately long-running task whose declared budget
+        exceeds the global default. NULL ``max_runtime_seconds`` (the
+        common case) falls back to the supplied ``threshold`` unchanged.
+
         Args:
-            threshold: A task is considered stale when
-                ``started_at + threshold < now()``. Should be at least
-                2x ``max_runtime`` to avoid reaping legitimately running
-                tasks, e.g. ``timedelta(seconds=max_runtime * 2)``.
+            threshold: Default per-task stale window for tasks that don't
+                have a ``max_runtime_seconds`` override (or whose override
+                is smaller than this default). A task is stale when
+                ``started_at + effective_threshold < now()``. Should be
+                at least 2x the worker's own ``max_runtime``, e.g.
+                ``timedelta(seconds=max_runtime * 2)``.
 
         Returns:
             Number of tasks reaped.
         """
         now = datetime.now(UTC)
-        cutoff = now - threshold
+        threshold_seconds = threshold.total_seconds()
+        # Per-row effective stale window: the larger of the supplied
+        # default and 2x the row's per-task override (NULL → just the
+        # default). Computed in SQL with ``GREATEST`` + ``COALESCE``
+        # so the reaper stays a single round-trip even when the row
+        # set is heterogeneous in declared budget.
+        effective_threshold_seconds = sa.func.greatest(
+            threshold_seconds,
+            sa.func.coalesce(Task.max_runtime_seconds * 2, threshold_seconds),
+        )
+        stale_cutoff = sa.func.now() - sa.func.make_interval(
+            sa.literal(0),  # years
+            sa.literal(0),  # months
+            sa.literal(0),  # weeks
+            sa.literal(0),  # days
+            sa.literal(0),  # hours
+            sa.literal(0),  # mins
+            effective_threshold_seconds,  # secs
+        )
         with self.session() as session:
             stmt = (
                 update(Task)
                 .where(
                     Task.status == TaskStatus.RUNNING,
-                    Task.started_at < cutoff,
+                    Task.started_at < stale_cutoff,
                 )
                 .values(
                     status=TaskStatus.FAILED,
                     completed_at=now,
                     error=(
-                        f"Reaped: task still RUNNING after {threshold} "
-                        f"(cutoff={cutoff.isoformat()}). Worker likely died."
+                        f"Reaped: task still RUNNING past its stale window "
+                        f"(default threshold={threshold}; per-task override "
+                        f"max_runtime_seconds is honored when present). "
+                        f"Worker likely died."
                     ),
                 )
                 .returning(Task.id, Task.name, Task.started_at)

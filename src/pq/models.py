@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Enum,
+    Float,
     Identity,
     Index,
     Integer,
@@ -70,6 +71,14 @@ class Task(Base):
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Per-task override of the worker-level ``max_runtime``. When NULL
+    # (the common case), the worker uses its configured default. When
+    # set, it caps this specific task's wall-clock at the given number
+    # of seconds AND extends the stale-reaper threshold proportionally
+    # (the reaper picks the larger of its global default and
+    # ``max_runtime_seconds * 2``). Useful for occasionally-long tasks
+    # in a fleet whose default is sized for typical short work.
+    max_runtime_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class Periodic(Base):
@@ -94,6 +103,17 @@ class Periodic(Base):
     next_run: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     max_concurrent: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    # Per-task override of the worker-level ``max_runtime``. Same semantics
+    # as ``Task.max_runtime_seconds`` — NULL means "use the worker's
+    # configured default", a set value caps this specific schedule's
+    # wall-clock at the given number of seconds and also extends the
+    # ``locked_until`` window (when ``max_concurrent`` is in effect) so
+    # the lock doesn't expire while the task is legitimately still
+    # running. Periodic tasks are not subject to the stale-task reaper
+    # (they're guarded by ``locked_until`` and the natural re-fire of
+    # the schedule), so this knob is purely about the per-execution
+    # wall-clock cap.
+    max_runtime_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     last_run: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
