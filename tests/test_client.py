@@ -800,6 +800,18 @@ class TestMaxRuntimeOverrideValidation:
         with pytest.raises(ValueError, match=r"max_runtime must be > 0"):
             pq.enqueue(dummy_handler, max_runtime=bad_value)
 
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_enqueue_rejects_non_finite_max_runtime(
+        self, pq: PQ, bad_value: float
+    ) -> None:
+        """NaN and ±infinity bypass the ``<= 0`` check (``nan <= 0`` is
+        False, ``inf <= 0`` is False), but neither produces useful
+        worker behaviour — ``signal.alarm`` raises on NaN/inf, the
+        reaper's ``max_runtime * 2`` SQL produces NaN/NULL, etc.
+        Reject up front so the bug stays at the call site."""
+        with pytest.raises(ValueError, match=r"must be a finite positive"):
+            pq.enqueue(dummy_handler, max_runtime=bad_value)
+
     @pytest.mark.parametrize("bad_value", [0, -1])
     def test_upsert_rejects_non_positive_max_runtime(
         self, pq: PQ, bad_value: float
@@ -1164,16 +1176,23 @@ class TestReapStaleTasksRespectsPerTaskOverride:
         assert "Reaped: task still RUNNING" in with_msg
         assert "Reaped: task still RUNNING" in without_msg
 
-        # Per-row max_runtime_seconds value appears in each.
-        assert "max_runtime_seconds=300" in with_msg, f"expected '300' in {with_msg!r}"
-        assert "max_runtime_seconds=NULL" in without_msg, (
-            f"expected 'NULL' in {without_msg!r}"
+        # Per-row max_runtime_seconds value appears in each. Substrings
+        # anchored with trailing punctuation so ``"=300"`` doesn't also
+        # match ``"=3000"`` (defends against a future refactor that
+        # changes the per-task multiplier from 2× to e.g. 3×).
+        assert "max_runtime_seconds=300," in with_msg, (
+            f"expected 'max_runtime_seconds=300,' in {with_msg!r}"
+        )
+        assert "max_runtime_seconds=NULL," in without_msg, (
+            f"expected 'max_runtime_seconds=NULL,' in {without_msg!r}"
         )
 
         # Effective threshold reflects the reaper math: with-override
         # got max(3600, 600)=3600 s; without-override got 3600 s default.
-        assert "effective threshold=3600" in with_msg
-        assert "effective threshold=3600" in without_msg
+        # Anchor with trailing " s)" to prevent ``"=3600"`` matching
+        # ``"=36000"`` in any future format change.
+        assert "effective threshold=3600 s)" in with_msg
+        assert "effective threshold=3600 s)" in without_msg
 
 
 class TestMigrationAppliesOnPopulatedTables:

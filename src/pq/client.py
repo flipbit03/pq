@@ -1,6 +1,7 @@
 """PQ client - main interface for task queue."""
 
 import importlib.resources
+import math
 from collections.abc import Callable, Set
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -26,15 +27,18 @@ def _validate_max_runtime(max_runtime: float | None) -> None:
     """Reject obviously-degenerate per-task ``max_runtime`` values.
 
     ``None`` means "use the worker's configured default" and is the
-    common case — nothing to validate. ``0`` or negative is rejected
-    because the downstream enforcement is undefined for those:
+    common case — nothing to validate. ``0``, negative, NaN, and
+    infinity are all rejected because the downstream enforcement is
+    undefined for those:
 
     - ``signal.alarm(int(max_runtime) + 1)`` would fire at 1 s for
-      ``0`` and at 0 s (which disables the alarm entirely) for any
-      negative integer ≥ -1.
-    - ``max_runtime * 2`` in the stale-reaper SQL would be ≤ 0,
-      making the per-row threshold a no-op (the global default would
-      apply) — silent surprise vs. the call site's intent.
+      ``0``, at 0 s (which disables the alarm entirely) for any
+      negative integer ≥ -1, and raise ``ValueError`` from inside
+      the worker for NaN / infinity.
+    - ``max_runtime * 2`` in the stale-reaper SQL would be ≤ 0 or
+      NaN, making the per-row threshold a no-op or NULL (the global
+      default would apply) — silent surprise vs. the call site's
+      intent.
     - Periodic ``lock_duration`` already guards with a 3600 s
       fallback for ``≤ 0`` (``worker.py``), but that fallback exists
       for the worker-level default, not as a contract for callers.
@@ -46,6 +50,11 @@ def _validate_max_runtime(max_runtime: float | None) -> None:
     """
     if max_runtime is None:
         return
+    if math.isnan(max_runtime) or math.isinf(max_runtime):
+        raise ValueError(
+            f"max_runtime must be a finite positive number (got {max_runtime!r}); "
+            f"pass None to use the worker's configured default."
+        )
     if max_runtime <= 0:
         raise ValueError(
             f"max_runtime must be > 0 (got {max_runtime!r}); pass None to "

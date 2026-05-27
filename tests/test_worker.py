@@ -99,6 +99,22 @@ def slow_sync_handler() -> None:
     time.sleep(10)
 
 
+async def tracked_slow_async_handler() -> None:
+    """Slow async handler that appends ``"completed"`` to shared state
+    only AFTER the sleep finishes.
+
+    Tests of "the per-task ``max_runtime`` killed the execution" assert
+    the absence of this marker — if the worker honoured the override
+    (e.g. 1 s cap), ``asyncio.wait_for`` cancels the coroutine before
+    the append; if it ignored the override and let the 10 s sleep
+    finish, the marker is written. This is stronger than asserting
+    ``periodic.last_run is not None``, because ``last_run`` is set
+    by the worker BEFORE the fork (Phase 1 — claim), independent of
+    whether the handler runs to completion."""
+    await asyncio.sleep(10)
+    _shared_results.append("completed")
+
+
 def lock_observer_handler(db_url: str) -> None:
     """Handler used by
     ``test_periodic_lock_duration_scales_with_per_task_max_runtime``.
@@ -1187,38 +1203,51 @@ class TestConcurrentWorker:
         db_url: str,
         manager: multiprocessing.managers.SyncManager,
     ) -> None:
-        """Same as above but on the periodic concurrent path."""
+        """Same as above but on the periodic concurrent path.
+
+        Uses ``tracked_slow_async_handler`` so we can assert on the
+        ABSENCE of the post-sleep marker — direct proof the kill
+        happened. ``last_run`` alone is set by the worker before the
+        fork (Phase 1), so it doesn't differentiate "killed by
+        per-task max_runtime" from "ran to completion"."""
         from sqlalchemy import select
 
+        results = manager.list()
+        _set_shared_results(results)
+
         pq.schedule(
-            slow_async_handler,
+            tracked_slow_async_handler,
             run_every=timedelta(seconds=60),
             max_runtime=1.0,
         )
 
         pid, _ = self._run_concurrent_worker(db_url, max_runtime=60)
 
-        # Wait for the periodic to fire once — ``last_run`` advances
-        # whether the execution succeeds or times out, so it's a clean
-        # signal that the worker processed (and per-task max_runtime
-        # killed) the execution.
+        # Wait until the worker has claimed AND processed the
+        # periodic. ``last_run`` advances at claim time (before fork),
+        # so it tells us "claim happened" — necessary precondition for
+        # the kill-or-not check below. We then wait a small grace
+        # period for the forked child to finish its 1 s timeout cycle
+        # (and, if the override was ignored, complete its 10 s sleep).
         def _periodic_fired() -> bool:
             with pq.session() as session:
                 p = session.execute(select(Periodic)).scalar_one()
                 return p.last_run is not None
 
         self._wait_for(_periodic_fired, timeout=15)
+        # Wait long enough that BOTH outcomes would have completed:
+        # - kill at ~1 s (override honoured): no marker written
+        # - 10 s sleep finishes (override ignored): marker written
+        # 13 s is past the 10 s sleep + post-execute lifecycle.
+        time.sleep(13)
         self._stop_worker(pid)
 
-        # If the concurrent periodic claim path forgot to read
-        # ``max_runtime_seconds``, the worker's 60 s default would let
-        # the 10 s slow_async sleep run to completion. With the
-        # per-task value applied, the asyncio.wait_for fires at 1 s
-        # and the task is killed.
-        with pq.session() as session:
-            p = session.execute(select(Periodic)).scalar_one()
-            assert p.max_runtime_seconds == 1.0
-            assert p.last_run is not None
+        assert list(results) == [], (
+            f"per-task max_runtime=1.0 on the concurrent periodic path "
+            f"should have killed the handler before its 10 s sleep "
+            f"finished; got results={list(results)} (handler ran to "
+            f"completion → override was ignored)"
+        )
 
 
 class TestStaleReaperRace:
@@ -1342,33 +1371,50 @@ class TestPerTaskMaxRuntimeEnforcement:
     # Periodic tasks — sequential path (``_process_periodic_task``)
     # ------------------------------------------------------------------
 
-    def test_periodic_async_task_uses_per_task_max_runtime(self, pq: PQ) -> None:
-        """Same as one-off but on the periodic path. The periodic
-        worker reads ``periodic.max_runtime_seconds`` and applies the
-        same effective-value rule."""
+    def test_periodic_async_task_uses_per_task_max_runtime(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Per-task override TIGHTER than worker default kills the
+        periodic handler before it can write the "completed" marker.
+
+        Asserting on the absence of the marker proves the kill
+        actually happened. (Earlier weaker version asserted
+        ``last_run is not None``, but the worker sets ``last_run``
+        BEFORE the fork — independent of whether the handler runs to
+        completion. The marker is set AFTER the slow sleep, so its
+        absence is a real signal that the override fired.)"""
+        results = manager.list()
+        _set_shared_results(results)
+
         pq.schedule(
-            slow_async_handler,
+            tracked_slow_async_handler,
             run_every=timedelta(seconds=60),
             max_runtime=0.1,
         )
         pq.run_worker_once(max_runtime=30)
-        # Periodic doesn't pop from pending_count; assert via the
-        # schedule's last_run timestamp moving forward.
-        from sqlalchemy import select
 
-        with pq.session() as session:
-            periodic = session.execute(select(Periodic)).scalar_one()
-            assert periodic.last_run is not None
+        assert list(results) == [], (
+            f"per-task max_runtime=0.1 should have killed the handler "
+            f"before its 10 s sleep finished; got results={list(results)}"
+        )
 
-    def test_periodic_task_falls_back_to_worker_default_when_null(self, pq: PQ) -> None:
-        """Backwards-compat for the periodic path."""
-        pq.schedule(slow_async_handler, run_every=timedelta(seconds=60))
-        pq.run_worker_once(max_runtime=0.1)  # worker default kills it
-        from sqlalchemy import select
+    def test_periodic_task_falls_back_to_worker_default_when_null(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Backwards-compat for the periodic path: NULL override means
+        the worker default applies. Worker default = 0.1 s here →
+        ``tracked_slow_async_handler``'s 10 s sleep never finishes →
+        marker never written."""
+        results = manager.list()
+        _set_shared_results(results)
 
-        with pq.session() as session:
-            periodic = session.execute(select(Periodic)).scalar_one()
-            assert periodic.last_run is not None
+        pq.schedule(tracked_slow_async_handler, run_every=timedelta(seconds=60))
+        pq.run_worker_once(max_runtime=0.1)
+
+        assert list(results) == [], (
+            f"worker default of 0.1 s should have killed the handler "
+            f"before its 10 s sleep finished; got results={list(results)}"
+        )
 
     def test_periodic_lock_duration_scales_with_per_task_max_runtime(
         self,
