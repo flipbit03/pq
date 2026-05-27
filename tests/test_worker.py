@@ -100,14 +100,26 @@ def slow_sync_handler() -> None:
 
 
 def lock_observer_handler(db_url: str) -> None:
-    """Handler used by ``test_periodic_lock_duration_scales_with_per_task_max_runtime``.
+    """Handler used by
+    ``test_periodic_lock_duration_scales_with_per_task_max_runtime``.
 
-    Queries its own periodic row mid-execution (before the
-    post-execution cleanup at ``worker.py:833`` clears ``locked_until``)
-    and stores the captured value into the test's shared
-    multiprocessing list. Runs in a forked child, so it opens its own
-    short-lived ``PQ`` client against the supplied ``db_url`` rather
-    than trying to reuse the parent's session.
+    The periodic worker sets ``locked_until = func.now() +
+    interval`` BEFORE forking (a SQL expression — not a Python
+    datetime), then clears it back to ``None`` after the task
+    finishes (``worker.py:833``). Two consequences for the test:
+
+    1. After ``run_worker_once`` returns, ``locked_until`` is back
+       to ``None`` — too late to observe.
+    2. A simpler ``pre_execute`` hook approach (read
+       ``task.locked_until`` from the periodic object passed in)
+       doesn't work either: the value is an unresolved SQLAlchemy
+       expression on the expunged row, and trying to read it raises
+       ``DetachedInstanceError`` because the lazy-load needs a
+       session.
+
+    So the only viable observation point is mid-handler, in the
+    forked child, with a freshly-opened session that re-queries
+    the row.
     """
     from sqlalchemy import select
 
@@ -1371,11 +1383,9 @@ class TestPerTaskMaxRuntimeEnforcement:
         otherwise a long-running periodic would lose its lock
         mid-execution and another worker could claim it.
 
-        Verifies by capturing ``locked_until`` from inside the forked
-        handler (via shared multiprocessing state) before the
-        post-execution cleanup at ``worker.py:833`` clears it back to
-        ``None``. Asserts the captured window is far closer to the
-        per-task override (120 s) than the worker default (30 s).
+        See ``lock_observer_handler`` for why the observation has to
+        happen mid-handler with a fresh DB query rather than via a
+        ``pre_execute`` hook or a post-run inspection.
         """
         captured = manager.list()
         _set_shared_results(captured)
