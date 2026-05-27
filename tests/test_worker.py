@@ -1138,6 +1138,76 @@ class TestConcurrentWorker:
         assert list(results) == [42]
         assert len(pq.list_completed()) == 1
 
+    # ------------------------------------------------------------------
+    # Per-task max_runtime override — concurrent paths
+    # ------------------------------------------------------------------
+    # Cover the ``_claim_and_fork_one_off`` and ``_claim_and_fork_periodic``
+    # code paths (``worker.py:844, 933``) which mirror the sequential
+    # ``_process_one_off_task`` / ``_process_periodic_task`` logic but
+    # are reached only under ``concurrency > 1``. Without these, a
+    # regression in the concurrent fork-claim path (where the per-task
+    # value is read off the row before ``session.expunge``) would slip
+    # past the sequential tests in ``TestPerTaskMaxRuntimeEnforcement``.
+
+    def test_one_off_per_task_max_runtime_honored_concurrent(
+        self, pq: PQ, db_url: str
+    ) -> None:
+        """Per-task ``max_runtime=1`` kills a slow task even when the
+        concurrent worker's own default is loose (60 s)."""
+        pq.enqueue(slow_sync_handler, max_runtime=1)
+
+        pid, _ = self._run_concurrent_worker(db_url, max_runtime=60)
+        self._wait_for(lambda: len(pq.list_failed()) >= 1, timeout=15)
+        self._stop_worker(pid)
+
+        failed = pq.list_failed()
+        assert len(failed) == 1
+        # Per-task value WAS honored: task died at ~1 s despite worker
+        # default of 60 s. If the concurrent claim path forgot to read
+        # ``max_runtime_seconds``, we'd hit the 10 s sleep instead and
+        # this assertion would time out long before failure.
+        assert "Timed out" in (failed[0].error or "")
+        assert failed[0].max_runtime_seconds == 1.0
+
+    def test_periodic_per_task_max_runtime_honored_concurrent(
+        self,
+        pq: PQ,
+        db_url: str,
+        manager: multiprocessing.managers.SyncManager,
+    ) -> None:
+        """Same as above but on the periodic concurrent path."""
+        from sqlalchemy import select
+
+        pq.schedule(
+            slow_async_handler,
+            run_every=timedelta(seconds=60),
+            max_runtime=1.0,
+        )
+
+        pid, _ = self._run_concurrent_worker(db_url, max_runtime=60)
+
+        # Wait for the periodic to fire once — ``last_run`` advances
+        # whether the execution succeeds or times out, so it's a clean
+        # signal that the worker processed (and per-task max_runtime
+        # killed) the execution.
+        def _periodic_fired() -> bool:
+            with pq.session() as session:
+                p = session.execute(select(Periodic)).scalar_one()
+                return p.last_run is not None
+
+        self._wait_for(_periodic_fired, timeout=15)
+        self._stop_worker(pid)
+
+        # If the concurrent periodic claim path forgot to read
+        # ``max_runtime_seconds``, the worker's 60 s default would let
+        # the 10 s slow_async sleep run to completion. With the
+        # per-task value applied, the asyncio.wait_for fires at 1 s
+        # and the task is killed.
+        with pq.session() as session:
+            p = session.execute(select(Periodic)).scalar_one()
+            assert p.max_runtime_seconds == 1.0
+            assert p.last_run is not None
+
 
 class TestStaleReaperRace:
     """Tests for the Phase 3 race between worker status update and reaper."""

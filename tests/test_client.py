@@ -781,6 +781,64 @@ class TestReapStaleTasks:
         assert reaped == 0
 
 
+class TestMaxRuntimeOverrideValidation:
+    """``max_runtime <= 0`` is rejected at the call site.
+
+    Why fail fast: ``signal.alarm(int(max_runtime) + 1)`` would fire at
+    1 s for ``0`` and at 0 s (disabling the alarm) for negative integer
+    ≥ -1; ``max_runtime * 2`` in the reaper would make the per-row
+    threshold a no-op silently; periodic ``lock_duration``'s ``≤ 0``
+    fallback to 3600 s is for the worker-level default, not a caller
+    contract. None of these are useful behaviours to expose, so the
+    client rejects them up front.
+    """
+
+    @pytest.mark.parametrize("bad_value", [0, 0.0, -1, -0.001, -1e9])
+    def test_enqueue_rejects_non_positive_max_runtime(
+        self, pq: PQ, bad_value: float
+    ) -> None:
+        with pytest.raises(ValueError, match=r"max_runtime must be > 0"):
+            pq.enqueue(dummy_handler, max_runtime=bad_value)
+
+    @pytest.mark.parametrize("bad_value", [0, -1])
+    def test_upsert_rejects_non_positive_max_runtime(
+        self, pq: PQ, bad_value: float
+    ) -> None:
+        with pytest.raises(ValueError, match=r"max_runtime must be > 0"):
+            pq.upsert(dummy_handler, max_runtime=bad_value, client_id="reject-ups")
+
+    @pytest.mark.parametrize("bad_value", [0, -1])
+    def test_schedule_rejects_non_positive_max_runtime(
+        self, pq: PQ, bad_value: float
+    ) -> None:
+        with pytest.raises(ValueError, match=r"max_runtime must be > 0"):
+            pq.schedule(
+                cleanup_handler,
+                run_every=timedelta(hours=1),
+                max_runtime=bad_value,
+            )
+
+    def test_enqueue_accepts_tiny_positive_max_runtime(self, pq: PQ) -> None:
+        """``0.001`` (1 ms) is a valid value — at the boundary of the
+        validator. Acceptance is the contract; the worker's
+        ``signal.alarm`` resolution floor is a separate concern
+        (documented on the worker)."""
+        task_id = pq.enqueue(dummy_handler, max_runtime=0.001)
+        with pq.session() as session:
+            task = session.get(Task, task_id)
+            assert task is not None
+            assert task.max_runtime_seconds == 0.001
+
+    def test_enqueue_accepts_none_explicitly(self, pq: PQ) -> None:
+        """``None`` is the contract for 'use worker default' and must
+        NOT raise — verifies the validator's early-return path."""
+        task_id = pq.enqueue(dummy_handler, max_runtime=None)
+        with pq.session() as session:
+            task = session.get(Task, task_id)
+            assert task is not None
+            assert task.max_runtime_seconds is None
+
+
 class TestMaxRuntimeOverridePersistence:
     """Tests for per-task ``max_runtime`` override storage.
 
@@ -1066,6 +1124,54 @@ class TestReapStaleTasksRespectsPerTaskOverride:
         assert pq.get_task(long_task).status == TaskStatus.RUNNING  # type: ignore[union-attr]
         assert pq.get_task(null_task).status == TaskStatus.FAILED  # type: ignore[union-attr]
         assert pq.get_task(short_task).status == TaskStatus.FAILED  # type: ignore[union-attr]
+
+    def test_reaper_error_message_includes_per_row_max_runtime(self, pq: PQ) -> None:
+        """The ``error`` written by the reaper names this row's own
+        ``max_runtime_seconds`` AND the effective threshold that
+        actually fired — so debugging "why did MY long-budget task
+        get reaped?" doesn't need a separate row lookup.
+
+        Two reaped rows in one call: one with a per-task override,
+        one without. The error column on each should reflect that
+        row's specific values, not a single shared message.
+        """
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        started = datetime.now(UTC) - timedelta(hours=4)
+        with_override = pq.enqueue(
+            dummy_handler, max_runtime=300.0, client_id="msg-with"
+        )
+        without_override = pq.enqueue(dummy_handler, client_id="msg-without")
+        with pq.session() as session:
+            for task_id in (with_override, without_override):
+                session.execute(
+                    update(Task)
+                    .where(Task.id == task_id)
+                    .values(status=TaskStatus.RUNNING, started_at=started)
+                )
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+        assert reaped == 2
+
+        with_msg = pq.get_task(with_override).error or ""  # type: ignore[union-attr]
+        without_msg = pq.get_task(without_override).error or ""  # type: ignore[union-attr]
+
+        # Both messages start with the common prefix.
+        assert "Reaped: task still RUNNING" in with_msg
+        assert "Reaped: task still RUNNING" in without_msg
+
+        # Per-row max_runtime_seconds value appears in each.
+        assert "max_runtime_seconds=300" in with_msg, f"expected '300' in {with_msg!r}"
+        assert "max_runtime_seconds=NULL" in without_msg, (
+            f"expected 'NULL' in {without_msg!r}"
+        )
+
+        # Effective threshold reflects the reaper math: with-override
+        # got max(3600, 600)=3600 s; without-override got 3600 s default.
+        assert "effective threshold=3600" in with_msg
+        assert "effective threshold=3600" in without_msg
 
 
 class TestMigrationAppliesOnPopulatedTables:

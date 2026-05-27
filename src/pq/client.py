@@ -22,6 +22,37 @@ from pq.registry import get_function_path
 from pq.serialization import serialize
 
 
+def _validate_max_runtime(max_runtime: float | None) -> None:
+    """Reject obviously-degenerate per-task ``max_runtime`` values.
+
+    ``None`` means "use the worker's configured default" and is the
+    common case — nothing to validate. ``0`` or negative is rejected
+    because the downstream enforcement is undefined for those:
+
+    - ``signal.alarm(int(max_runtime) + 1)`` would fire at 1 s for
+      ``0`` and at 0 s (which disables the alarm entirely) for any
+      negative integer ≥ -1.
+    - ``max_runtime * 2`` in the stale-reaper SQL would be ≤ 0,
+      making the per-row threshold a no-op (the global default would
+      apply) — silent surprise vs. the call site's intent.
+    - Periodic ``lock_duration`` already guards with a 3600 s
+      fallback for ``≤ 0`` (``worker.py``), but that fallback exists
+      for the worker-level default, not as a contract for callers.
+
+    None of these are useful behaviours to expose. Failing fast at
+    enqueue/upsert/schedule time keeps the bug at the call site,
+    where it's trivially fixable, instead of producing a confusing
+    runtime surprise hours later.
+    """
+    if max_runtime is None:
+        return
+    if max_runtime <= 0:
+        raise ValueError(
+            f"max_runtime must be > 0 (got {max_runtime!r}); pass None to "
+            f"use the worker's configured default."
+        )
+
+
 class PQ:
     """Postgres-backed task queue client."""
 
@@ -150,9 +181,11 @@ class PQ:
             Task ID.
 
         Raises:
-            ValueError: If task is a lambda, closure, or cannot be imported.
+            ValueError: If task is a lambda, closure, or cannot be imported,
+                or if ``max_runtime`` is not None and ``<= 0``.
             IntegrityError: If client_id already exists.
         """
+        _validate_max_runtime(max_runtime)
         name = get_function_path(task)
         payload = serialize(args, kwargs)
 
@@ -203,8 +236,10 @@ class PQ:
             Task ID.
 
         Raises:
-            ValueError: If task is a lambda, closure, or cannot be imported.
+            ValueError: If task is a lambda, closure, or cannot be imported,
+                or if ``max_runtime`` is not None and ``<= 0``.
         """
+        _validate_max_runtime(max_runtime)
         name = get_function_path(task)
         payload = serialize(args, kwargs)
 
@@ -295,6 +330,7 @@ class PQ:
             ValueError: If cron expression is invalid.
             ValueError: If max_concurrent is greater than 1.
             ValueError: If task is a lambda, closure, or cannot be imported.
+            ValueError: If ``max_runtime`` is not None and ``<= 0``.
             IntegrityError: If client_id already exists.
         """
         if run_every is None and cron is None:
@@ -306,6 +342,7 @@ class PQ:
                 f"max_concurrent must be 1 or None, got {max_concurrent} "
                 "(values > 1 reserved for future use)"
             )
+        _validate_max_runtime(max_runtime)
 
         # Validate and normalize cron expression
         cron_expr: str | None = None
@@ -581,6 +618,22 @@ class PQ:
             sa.literal(0),  # mins
             effective_threshold_seconds,  # secs
         )
+        # Per-row ``error`` message includes the values that actually
+        # decided this row's fate: the row's own
+        # ``max_runtime_seconds`` (or ``NULL`` if unset) and the
+        # effective threshold the reaper applied. This avoids the
+        # operator needing a separate query to figure out "why did MY
+        # long-budget task get reaped?" — the answer is in the row.
+        # Built with Postgres ``format()`` so the message is computed
+        # per row in the same UPDATE round-trip.
+        per_row_error = sa.func.format(
+            "Reaped: task still RUNNING past its stale window "
+            "(default threshold=%s s, per-task max_runtime_seconds=%s, "
+            "effective threshold=%s s). Worker likely died.",
+            threshold_seconds,
+            sa.func.coalesce(sa.cast(Task.max_runtime_seconds, sa.String), "NULL"),
+            effective_threshold_seconds,
+        )
         with self.session() as session:
             stmt = (
                 update(Task)
@@ -591,20 +644,21 @@ class PQ:
                 .values(
                     status=TaskStatus.FAILED,
                     completed_at=now,
-                    error=(
-                        f"Reaped: task still RUNNING past its stale window "
-                        f"(default threshold={threshold}; per-task override "
-                        f"max_runtime_seconds is honored when present). "
-                        f"Worker likely died."
-                    ),
+                    error=per_row_error,
                 )
-                .returning(Task.id, Task.name, Task.started_at)
+                .returning(
+                    Task.id,
+                    Task.name,
+                    Task.started_at,
+                    Task.max_runtime_seconds,
+                )
             )
             reaped = list(session.execute(stmt).all())
-            for task_id, name, started_at in reaped:
+            for task_id, name, started_at, max_runtime_seconds in reaped:
                 logger.warning(
                     f"Reaped stale task '{name}' (id={task_id},"
-                    f" started_at={started_at})"
+                    f" started_at={started_at},"
+                    f" max_runtime_seconds={max_runtime_seconds})"
                 )
             return len(reaped)
 
