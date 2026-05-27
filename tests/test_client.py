@@ -941,10 +941,12 @@ class TestMaxRuntimeOverridePersistence:
             max_runtime=999.0,
             key="override-sched-conflict",
         )
+        from sqlalchemy import select
+
         with pq.session() as session:
-            periodic = (
-                session.query(Periodic).filter_by(key="override-sched-conflict").one()
-            )
+            periodic = session.execute(
+                select(Periodic).where(Periodic.key == "override-sched-conflict")
+            ).scalar_one()
             assert periodic.max_runtime_seconds == 999.0
 
         # And clears back to NULL when the kwarg is omitted on re-schedule
@@ -954,9 +956,9 @@ class TestMaxRuntimeOverridePersistence:
             key="override-sched-conflict",
         )
         with pq.session() as session:
-            periodic = (
-                session.query(Periodic).filter_by(key="override-sched-conflict").one()
-            )
+            periodic = session.execute(
+                select(Periodic).where(Periodic.key == "override-sched-conflict")
+            ).scalar_one()
             assert periodic.max_runtime_seconds is None
 
 
@@ -1250,18 +1252,18 @@ class TestMigrationAppliesOnPopulatedTables:
             # exactly what the worker treats as "use my configured
             # default", so the migration is backwards-compatible by
             # construction.
+            from sqlalchemy import select
+
             with pq.session() as session:
-                old_task = (
-                    session.query(Task).filter_by(client_id="during-old-schema").one()
-                )
+                old_task = session.execute(
+                    select(Task).where(Task.client_id == "during-old-schema")
+                ).scalar_one()
                 assert old_task.max_runtime_seconds is None
                 assert old_task.status == TaskStatus.PENDING
 
-                old_periodic = (
-                    session.query(Periodic)
-                    .filter_by(client_id="during-old-schema-p")
-                    .one()
-                )
+                old_periodic = session.execute(
+                    select(Periodic).where(Periodic.client_id == "during-old-schema-p")
+                ).scalar_one()
                 assert old_periodic.max_runtime_seconds is None
 
             # And the override mechanic works post-upgrade — proves
