@@ -1,6 +1,7 @@
 """PQ client - main interface for task queue."""
 
 import importlib.resources
+import math
 from collections.abc import Callable, Set
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,7 @@ from typing import Any, Self
 from croniter import croniter
 from croniter.croniter import CroniterBadCronError
 from loguru import logger
+import sqlalchemy as sa
 from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
@@ -19,6 +21,45 @@ from pq.models import Base, Periodic, Task, TaskStatus
 from pq.priority import Priority
 from pq.registry import get_function_path
 from pq.serialization import serialize
+
+
+def _validate_max_runtime(max_runtime_seconds: float | None) -> None:
+    """Reject obviously-degenerate per-task ``max_runtime_seconds`` values.
+
+    ``None`` means "use the worker's configured default" and is the
+    common case — nothing to validate. ``0``, negative, NaN, and
+    infinity are all rejected because the downstream enforcement is
+    undefined for those:
+
+    - ``signal.alarm(int(max_runtime_seconds) + 1)`` would fire at 1 s for
+      ``0``, at 0 s (which disables the alarm entirely) for any
+      negative integer ≥ -1, and raise ``ValueError`` from inside
+      the worker for NaN / infinity.
+    - ``max_runtime_seconds * 2`` in the stale-reaper SQL would be ≤ 0 or
+      NaN, making the per-row threshold a no-op or NULL (the global
+      default would apply) — silent surprise vs. the call site's
+      intent.
+    - Periodic ``lock_duration`` already guards with a 3600 s
+      fallback for ``≤ 0`` (``worker.py``), but that fallback exists
+      for the worker-level default, not as a contract for callers.
+
+    None of these are useful behaviours to expose. Failing fast at
+    enqueue/upsert/schedule time keeps the bug at the call site,
+    where it's trivially fixable, instead of producing a confusing
+    runtime surprise hours later.
+    """
+    if max_runtime_seconds is None:
+        return
+    if math.isnan(max_runtime_seconds) or math.isinf(max_runtime_seconds):
+        raise ValueError(
+            f"max_runtime_seconds must be a finite positive number (got {max_runtime_seconds!r}); "
+            f"pass None to use the worker's configured default."
+        )
+    if max_runtime_seconds <= 0:
+        raise ValueError(
+            f"max_runtime_seconds must be > 0 (got {max_runtime_seconds!r}); pass None to "
+            f"use the worker's configured default."
+        )
 
 
 class PQ:
@@ -125,6 +166,7 @@ class PQ:
         run_at: datetime | None = None,
         priority: Priority = Priority.NORMAL,
         client_id: str | None = None,
+        max_runtime_seconds: float | None = None,
         **kwargs: Any,
     ) -> int:
         """Enqueue a one-off task.
@@ -135,15 +177,24 @@ class PQ:
             run_at: When to run the task. Defaults to now.
             priority: Task priority. Higher = higher priority. Defaults to NORMAL.
             client_id: Optional client-provided identifier. Must be unique if provided.
+            max_runtime_seconds: Per-task wall-clock cap in seconds. When ``None`` (the
+                common case), the worker that picks up this task uses its
+                configured default. When set, this specific task gets the
+                supplied ceiling AND the stale-reaper threshold scales with
+                it (``max_runtime_seconds * 2`` if larger than the reaper's global
+                default). Use this for occasionally-long tasks in a fleet
+                whose worker default is sized for typical short work.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
             Task ID.
 
         Raises:
-            ValueError: If task is a lambda, closure, or cannot be imported.
+            ValueError: If task is a lambda, closure, or cannot be imported,
+                or if ``max_runtime_seconds`` is not None and ``<= 0``.
             IntegrityError: If client_id already exists.
         """
+        _validate_max_runtime(max_runtime_seconds)
         name = get_function_path(task)
         payload = serialize(args, kwargs)
 
@@ -156,6 +207,7 @@ class PQ:
             run_at=run_at,
             priority=priority,
             client_id=client_id,
+            max_runtime_seconds=max_runtime_seconds,
         )
 
         with self.session() as session:
@@ -170,6 +222,7 @@ class PQ:
         run_at: datetime | None = None,
         priority: Priority = Priority.NORMAL,
         client_id: str,
+        max_runtime_seconds: float | None = None,
         **kwargs: Any,
     ) -> int:
         """Enqueue a task, updating if client_id already exists.
@@ -183,14 +236,19 @@ class PQ:
             run_at: When to run the task. Defaults to now.
             priority: Task priority. Higher = higher priority. Defaults to NORMAL.
             client_id: Client-provided identifier. Required for conflict resolution.
+            max_runtime_seconds: Per-task wall-clock cap in seconds. See ``enqueue`` for
+                details. ``None`` (the default) leaves the worker's own
+                configured ``max_runtime_seconds`` in effect.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
             Task ID.
 
         Raises:
-            ValueError: If task is a lambda, closure, or cannot be imported.
+            ValueError: If task is a lambda, closure, or cannot be imported,
+                or if ``max_runtime_seconds`` is not None and ``<= 0``.
         """
+        _validate_max_runtime(max_runtime_seconds)
         name = get_function_path(task)
         payload = serialize(args, kwargs)
 
@@ -206,6 +264,7 @@ class PQ:
                 priority=priority,
                 status=TaskStatus.PENDING,
                 run_at=run_at,
+                max_runtime_seconds=max_runtime_seconds,
             )
             .on_conflict_do_update(
                 index_elements=["client_id"],
@@ -215,6 +274,7 @@ class PQ:
                     "priority": priority,
                     "status": TaskStatus.PENDING,
                     "run_at": run_at,
+                    "max_runtime_seconds": max_runtime_seconds,
                     "attempts": 0,
                     "started_at": None,
                     "completed_at": None,
@@ -239,6 +299,7 @@ class PQ:
         max_concurrent: int | None = 1,
         key: str = "",
         active: bool = True,
+        max_runtime_seconds: float | None = None,
         **kwargs: Any,
     ) -> int:
         """Schedule a periodic task.
@@ -260,6 +321,14 @@ class PQ:
                 Defaults to "" (empty string).
             active: Whether the task is active. Inactive tasks are not executed.
                 Defaults to True.
+            max_runtime_seconds: Per-execution wall-clock cap in seconds. When ``None``
+                (the common case), each execution uses the worker's configured
+                default. When set, this schedule's executions get the
+                supplied ceiling, and the ``locked_until`` window (used when
+                ``max_concurrent`` is in effect) is extended to match so the
+                lock doesn't expire while the execution is legitimately still
+                running. Periodic tasks are not subject to the stale-task
+                reaper, so this knob is purely about the wall-clock cap.
             **kwargs: Keyword arguments to pass to the handler.
 
         Returns:
@@ -270,6 +339,7 @@ class PQ:
             ValueError: If cron expression is invalid.
             ValueError: If max_concurrent is greater than 1.
             ValueError: If task is a lambda, closure, or cannot be imported.
+            ValueError: If ``max_runtime_seconds`` is not None and ``<= 0``.
             IntegrityError: If client_id already exists.
         """
         if run_every is None and cron is None:
@@ -281,6 +351,7 @@ class PQ:
                 f"max_concurrent must be 1 or None, got {max_concurrent} "
                 "(values > 1 reserved for future use)"
             )
+        _validate_max_runtime(max_runtime_seconds)
 
         # Validate and normalize cron expression
         cron_expr: str | None = None
@@ -321,6 +392,7 @@ class PQ:
                     client_id=client_id,
                     max_concurrent=max_concurrent,
                     active=active,
+                    max_runtime_seconds=max_runtime_seconds,
                 )
                 .on_conflict_do_update(
                     index_elements=["name", "key"],
@@ -332,6 +404,7 @@ class PQ:
                         "next_run": next_run,
                         "max_concurrent": max_concurrent,
                         "active": active,
+                        "max_runtime_seconds": max_runtime_seconds,
                     },
                 )
                 .returning(Periodic.id)
@@ -516,39 +589,85 @@ class PQ:
         process remains to update their status. This method detects those
         orphaned rows and transitions them to FAILED.
 
+        Tasks enqueued with a per-task ``max_runtime_seconds`` override get a
+        proportionally larger reaper window: the effective threshold for
+        a row is ``max(threshold, max_runtime_seconds * 2)``. This avoids
+        reaping a legitimately long-running task whose declared budget
+        exceeds the global default. NULL ``max_runtime_seconds`` (the
+        common case) falls back to the supplied ``threshold`` unchanged.
+
         Args:
-            threshold: A task is considered stale when
-                ``started_at + threshold < now()``. Should be at least
-                2x ``max_runtime`` to avoid reaping legitimately running
-                tasks, e.g. ``timedelta(seconds=max_runtime * 2)``.
+            threshold: Default per-task stale window for tasks that don't
+                have a ``max_runtime_seconds`` override (or whose override
+                is smaller than this default). A task is stale when
+                ``started_at + effective_threshold < now()``. Should be
+                at least 2x the worker's own ``max_runtime_seconds``, e.g.
+                ``timedelta(seconds=max_runtime_seconds * 2)``.
 
         Returns:
             Number of tasks reaped.
         """
         now = datetime.now(UTC)
-        cutoff = now - threshold
+        threshold_seconds = threshold.total_seconds()
+        # Per-row effective stale window: the larger of the supplied
+        # default and 2x the row's per-task override (NULL → just the
+        # default). Computed in SQL with ``GREATEST`` + ``COALESCE``
+        # so the reaper stays a single round-trip even when the row
+        # set is heterogeneous in declared budget.
+        effective_threshold_seconds = sa.func.greatest(
+            threshold_seconds,
+            sa.func.coalesce(Task.max_runtime_seconds * 2, threshold_seconds),
+        )
+        stale_cutoff = sa.func.now() - sa.func.make_interval(
+            sa.literal(0),  # years
+            sa.literal(0),  # months
+            sa.literal(0),  # weeks
+            sa.literal(0),  # days
+            sa.literal(0),  # hours
+            sa.literal(0),  # mins
+            effective_threshold_seconds,  # secs
+        )
+        # Per-row ``error`` message includes the values that actually
+        # decided this row's fate: the row's own
+        # ``max_runtime_seconds`` (or ``NULL`` if unset) and the
+        # effective threshold the reaper applied. This avoids the
+        # operator needing a separate query to figure out "why did MY
+        # long-budget task get reaped?" — the answer is in the row.
+        # Built with Postgres ``format()`` so the message is computed
+        # per row in the same UPDATE round-trip.
+        per_row_error = sa.func.format(
+            "Reaped: task still RUNNING past its stale window "
+            "(default threshold=%s s, per-task max_runtime_seconds=%s, "
+            "effective threshold=%s s). Worker likely died.",
+            threshold_seconds,
+            sa.func.coalesce(sa.cast(Task.max_runtime_seconds, sa.String), "NULL"),
+            effective_threshold_seconds,
+        )
         with self.session() as session:
             stmt = (
                 update(Task)
                 .where(
                     Task.status == TaskStatus.RUNNING,
-                    Task.started_at < cutoff,
+                    Task.started_at < stale_cutoff,
                 )
                 .values(
                     status=TaskStatus.FAILED,
                     completed_at=now,
-                    error=(
-                        f"Reaped: task still RUNNING after {threshold} "
-                        f"(cutoff={cutoff.isoformat()}). Worker likely died."
-                    ),
+                    error=per_row_error,
                 )
-                .returning(Task.id, Task.name, Task.started_at)
+                .returning(
+                    Task.id,
+                    Task.name,
+                    Task.started_at,
+                    Task.max_runtime_seconds,
+                )
             )
             reaped = list(session.execute(stmt).all())
-            for task_id, name, started_at in reaped:
+            for task_id, name, started_at, max_runtime_seconds in reaped:
                 logger.warning(
                     f"Reaped stale task '{name}' (id={task_id},"
-                    f" started_at={started_at})"
+                    f" started_at={started_at},"
+                    f" max_runtime_seconds={max_runtime_seconds})"
                 )
             return len(reaped)
 

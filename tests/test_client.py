@@ -779,3 +779,532 @@ class TestReapStaleTasks:
         reaped = pq.reap_stale_tasks(timedelta(hours=1))
 
         assert reaped == 0
+
+
+class TestMaxRuntimeOverrideValidation:
+    """``max_runtime_seconds <= 0`` is rejected at the call site.
+
+    Why fail fast: ``signal.alarm(int(max_runtime_seconds) + 1)`` would fire at
+    1 s for ``0`` and at 0 s (disabling the alarm) for negative integer
+    ≥ -1; ``max_runtime_seconds * 2`` in the reaper would make the per-row
+    threshold a no-op silently; periodic ``lock_duration``'s ``≤ 0``
+    fallback to 3600 s is for the worker-level default, not a caller
+    contract. None of these are useful behaviours to expose, so the
+    client rejects them up front.
+    """
+
+    @pytest.mark.parametrize("bad_value", [0, 0.0, -1, -0.001, -1e9])
+    def test_enqueue_rejects_non_positive_max_runtime(
+        self, pq: PQ, bad_value: float
+    ) -> None:
+        with pytest.raises(ValueError, match=r"max_runtime_seconds must be > 0"):
+            pq.enqueue(dummy_handler, max_runtime_seconds=bad_value)
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_enqueue_rejects_non_finite_max_runtime(
+        self, pq: PQ, bad_value: float
+    ) -> None:
+        """NaN and ±infinity bypass the ``<= 0`` check (``nan <= 0`` is
+        False, ``inf <= 0`` is False), but neither produces useful
+        worker behaviour — ``signal.alarm`` raises on NaN/inf, the
+        reaper's ``max_runtime_seconds * 2`` SQL produces NaN/NULL, etc.
+        Reject up front so the bug stays at the call site."""
+        with pytest.raises(ValueError, match=r"must be a finite positive"):
+            pq.enqueue(dummy_handler, max_runtime_seconds=bad_value)
+
+    @pytest.mark.parametrize("bad_value", [0, -1])
+    def test_upsert_rejects_non_positive_max_runtime(
+        self, pq: PQ, bad_value: float
+    ) -> None:
+        with pytest.raises(ValueError, match=r"max_runtime_seconds must be > 0"):
+            pq.upsert(
+                dummy_handler, max_runtime_seconds=bad_value, client_id="reject-ups"
+            )
+
+    @pytest.mark.parametrize("bad_value", [0, -1])
+    def test_schedule_rejects_non_positive_max_runtime(
+        self, pq: PQ, bad_value: float
+    ) -> None:
+        with pytest.raises(ValueError, match=r"max_runtime_seconds must be > 0"):
+            pq.schedule(
+                cleanup_handler,
+                run_every=timedelta(hours=1),
+                max_runtime_seconds=bad_value,
+            )
+
+    def test_enqueue_accepts_tiny_positive_max_runtime(self, pq: PQ) -> None:
+        """``0.001`` (1 ms) is a valid value — at the boundary of the
+        validator. Acceptance is the contract; the worker's
+        ``signal.alarm`` resolution floor is a separate concern
+        (documented on the worker)."""
+        task_id = pq.enqueue(dummy_handler, max_runtime_seconds=0.001)
+        with pq.session() as session:
+            task = session.get(Task, task_id)
+            assert task is not None
+            assert task.max_runtime_seconds == 0.001
+
+    def test_enqueue_accepts_none_explicitly(self, pq: PQ) -> None:
+        """``None`` is the contract for 'use worker default' and must
+        NOT raise — verifies the validator's early-return path."""
+        task_id = pq.enqueue(dummy_handler, max_runtime_seconds=None)
+        with pq.session() as session:
+            task = session.get(Task, task_id)
+            assert task is not None
+            assert task.max_runtime_seconds is None
+
+
+class TestMaxRuntimeOverridePersistence:
+    """Tests for per-task ``max_runtime_seconds`` override storage.
+
+    Verifies that ``Client.enqueue``, ``Client.upsert`` and ``Client.schedule``
+    correctly persist the new ``max_runtime_seconds`` column on the
+    ``Task`` and ``Periodic`` rows. NULL when not provided (the common
+    case, which preserves pre-feature behaviour for every existing call
+    site); the supplied float when provided.
+    """
+
+    def test_enqueue_persists_max_runtime_seconds(self, pq: PQ) -> None:
+        task_id = pq.enqueue(
+            dummy_handler, max_runtime_seconds=172_800.0, client_id="override-enq-1"
+        )
+        with pq.session() as session:
+            task = session.get(Task, task_id)
+            assert task is not None
+            assert task.max_runtime_seconds == 172_800.0
+
+    def test_enqueue_without_max_runtime_stores_null(self, pq: PQ) -> None:
+        """Backward-compat: every existing enqueue call site (which never
+        passes the new kwarg) keeps producing rows with NULL in the new
+        column. That NULL is what the worker treats as 'use my default'."""
+        task_id = pq.enqueue(dummy_handler, client_id="override-enq-null")
+        with pq.session() as session:
+            task = session.get(Task, task_id)
+            assert task is not None
+            assert task.max_runtime_seconds is None
+
+    def test_upsert_persists_max_runtime_seconds(self, pq: PQ) -> None:
+        task_id = pq.upsert(
+            dummy_handler, max_runtime_seconds=3600.0, client_id="override-ups-1"
+        )
+        with pq.session() as session:
+            task = session.get(Task, task_id)
+            assert task is not None
+            assert task.max_runtime_seconds == 3600.0
+
+    def test_upsert_overwrites_max_runtime_on_conflict(self, pq: PQ) -> None:
+        """On client_id conflict, ``upsert`` rewrites every field
+        including ``max_runtime_seconds``. Verifies an existing value
+        can be replaced AND that re-upserting with ``None`` clears it
+        back to NULL (so the same call site can opt-out later)."""
+        first_id = pq.upsert(
+            dummy_handler, max_runtime_seconds=10.0, client_id="override-ups-conflict"
+        )
+        second_id = pq.upsert(
+            dummy_handler, max_runtime_seconds=999.0, client_id="override-ups-conflict"
+        )
+        assert first_id == second_id
+        with pq.session() as session:
+            task = session.get(Task, second_id)
+            assert task is not None
+            assert task.max_runtime_seconds == 999.0
+
+        # Now clear it back to NULL
+        third_id = pq.upsert(dummy_handler, client_id="override-ups-conflict")
+        assert third_id == second_id
+        with pq.session() as session:
+            task = session.get(Task, third_id)
+            assert task is not None
+            assert task.max_runtime_seconds is None
+
+    def test_schedule_persists_max_runtime_seconds(self, pq: PQ) -> None:
+        """The periodic side of the API supports the same override."""
+        periodic_id = pq.schedule(
+            cleanup_handler,
+            run_every=timedelta(hours=1),
+            max_runtime_seconds=7200.0,
+            client_id="override-sched-1",
+        )
+        with pq.session() as session:
+            periodic = session.get(Periodic, periodic_id)
+            assert periodic is not None
+            assert periodic.max_runtime_seconds == 7200.0
+
+    def test_schedule_without_max_runtime_stores_null(self, pq: PQ) -> None:
+        periodic_id = pq.schedule(
+            cleanup_handler,
+            run_every=timedelta(hours=1),
+            client_id="override-sched-null",
+        )
+        with pq.session() as session:
+            periodic = session.get(Periodic, periodic_id)
+            assert periodic is not None
+            assert periodic.max_runtime_seconds is None
+
+    def test_schedule_overwrites_max_runtime_on_conflict(self, pq: PQ) -> None:
+        """Re-scheduling the same (name, key) rewrites the override —
+        analogous to the upsert behaviour."""
+        pq.schedule(
+            cleanup_handler,
+            run_every=timedelta(hours=1),
+            max_runtime_seconds=10.0,
+            key="override-sched-conflict",
+        )
+        pq.schedule(
+            cleanup_handler,
+            run_every=timedelta(hours=1),
+            max_runtime_seconds=999.0,
+            key="override-sched-conflict",
+        )
+        from sqlalchemy import select
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(Periodic.key == "override-sched-conflict")
+            ).scalar_one()
+            assert periodic.max_runtime_seconds == 999.0
+
+        # And clears back to NULL when the kwarg is omitted on re-schedule
+        pq.schedule(
+            cleanup_handler,
+            run_every=timedelta(hours=1),
+            key="override-sched-conflict",
+        )
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(Periodic.key == "override-sched-conflict")
+            ).scalar_one()
+            assert periodic.max_runtime_seconds is None
+
+
+class TestReapStaleTasksRespectsPerTaskOverride:
+    """Tests that the reaper SQL honours per-task ``max_runtime_seconds``.
+
+    The reaper takes a default ``threshold`` (used for tasks without
+    an override) and switches to ``max(default_threshold, 2 *
+    max_runtime_seconds)`` per row. This means a legitimately
+    long-running task that declared a big budget is NOT reaped before
+    the budget * 2 elapses — even if the worker default would have
+    reaped it sooner. Tasks without an override keep the previous
+    behaviour exactly.
+    """
+
+    def test_does_not_reap_long_task_within_per_task_threshold(self, pq: PQ) -> None:
+        """Task with ``max_runtime_seconds=3600`` (1h) started 30 min ago is NOT
+        reaped, even when the reaper's default threshold is 10 min.
+        Pre-feature, the row would have been reaped (started_at + 10min
+        already past)."""
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        task_id = pq.enqueue(
+            dummy_handler, max_runtime_seconds=3600.0, client_id="long-task-1"
+        )
+        with pq.session() as session:
+            session.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status=TaskStatus.RUNNING,
+                    started_at=datetime.now(UTC) - timedelta(minutes=30),
+                )
+            )
+
+        # Default threshold = 10 min. The per-task budget * 2 = 2h, so
+        # the row's effective threshold is 2h, and 30 min < 2h → not stale.
+        reaped = pq.reap_stale_tasks(timedelta(minutes=10))
+
+        assert reaped == 0
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+
+    def test_reaps_long_task_once_per_task_threshold_elapses(self, pq: PQ) -> None:
+        """Same task as above, but started long enough ago to exceed
+        ``2 * max_runtime_seconds``: gets reaped."""
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        task_id = pq.enqueue(
+            dummy_handler, max_runtime_seconds=60.0, client_id="long-task-2"
+        )
+        # 60s budget × 2 = 120s threshold; started_at was 10 min ago.
+        with pq.session() as session:
+            session.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status=TaskStatus.RUNNING,
+                    started_at=datetime.now(UTC) - timedelta(minutes=10),
+                )
+            )
+
+        # Default threshold = 1 min. Per-task threshold = 2 min.
+        # Effective per-row = max(1, 2) = 2 min. 10 min > 2 min → reaped.
+        reaped = pq.reap_stale_tasks(timedelta(minutes=1))
+
+        assert reaped == 1
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+
+    def test_reaps_unoverridden_task_with_default_threshold(self, pq: PQ) -> None:
+        """Task without ``max_runtime_seconds`` (NULL): the reaper falls
+        back to the supplied default threshold. This is the
+        backward-compat path — covers every existing call site that
+        doesn't pass the new kwarg."""
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        task_id = pq.enqueue(dummy_handler, client_id="null-override-stale")
+        with pq.session() as session:
+            session.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status=TaskStatus.RUNNING,
+                    started_at=datetime.now(UTC) - timedelta(hours=2),
+                )
+            )
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+
+        assert reaped == 1
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+
+    def test_default_threshold_acts_as_floor_when_larger_than_per_task(
+        self, pq: PQ
+    ) -> None:
+        """When the supplied default threshold is LARGER than ``2 *
+        per_task``, the default still applies. This prevents a tiny
+        per-task budget from accidentally tightening the reaper window
+        below what the worker fleet expects."""
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        # Tiny per-task budget (10s, so 2× = 20s) but default threshold
+        # is 1h. Effective per-row = max(1h, 20s) = 1h.
+        task_id = pq.enqueue(
+            dummy_handler, max_runtime_seconds=10.0, client_id="tiny-override"
+        )
+        with pq.session() as session:
+            session.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status=TaskStatus.RUNNING,
+                    started_at=datetime.now(UTC) - timedelta(minutes=30),
+                )
+            )
+
+        # 30 min < 1h default → not reaped (despite per-task * 2 = 20s
+        # being exceeded), because the default is the floor.
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+
+        assert reaped == 0
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+
+    def test_mixed_tasks_reaped_independently(self, pq: PQ) -> None:
+        """A batch with mixed overrides — verifies the reaper applies
+        the per-row condition correctly, not a single threshold across
+        all rows."""
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        # All started 30 min ago.
+        started = datetime.now(UTC) - timedelta(minutes=30)
+        long_task = pq.enqueue(
+            dummy_handler, max_runtime_seconds=3600.0, client_id="mixed-long"
+        )
+        null_task = pq.enqueue(dummy_handler, client_id="mixed-null")
+        short_task = pq.enqueue(
+            dummy_handler, max_runtime_seconds=60.0, client_id="mixed-short"
+        )
+        with pq.session() as session:
+            for task_id in (long_task, null_task, short_task):
+                session.execute(
+                    update(Task)
+                    .where(Task.id == task_id)
+                    .values(status=TaskStatus.RUNNING, started_at=started)
+                )
+
+        # Default threshold = 10 min.
+        # long_task: per-row = max(10min, 2h) = 2h → 30min < 2h, NOT reaped
+        # null_task: per-row = 10min default → 30min > 10min, REAPED
+        # short_task: per-row = max(10min, 2min) = 10min → 30min > 10min, REAPED
+        reaped = pq.reap_stale_tasks(timedelta(minutes=10))
+
+        assert reaped == 2
+        assert pq.get_task(long_task).status == TaskStatus.RUNNING  # type: ignore[union-attr]
+        assert pq.get_task(null_task).status == TaskStatus.FAILED  # type: ignore[union-attr]
+        assert pq.get_task(short_task).status == TaskStatus.FAILED  # type: ignore[union-attr]
+
+    def test_reaper_error_message_includes_per_row_max_runtime(self, pq: PQ) -> None:
+        """The ``error`` written by the reaper names this row's own
+        ``max_runtime_seconds`` AND the effective threshold that
+        actually fired — so debugging "why did MY long-budget task
+        get reaped?" doesn't need a separate row lookup.
+
+        Two reaped rows in one call: one with a per-task override,
+        one without. The error column on each should reflect that
+        row's specific values, not a single shared message.
+        """
+        from sqlalchemy import update
+
+        from pq.models import TaskStatus
+
+        started = datetime.now(UTC) - timedelta(hours=4)
+        with_override = pq.enqueue(
+            dummy_handler, max_runtime_seconds=300.0, client_id="msg-with"
+        )
+        without_override = pq.enqueue(dummy_handler, client_id="msg-without")
+        with pq.session() as session:
+            for task_id in (with_override, without_override):
+                session.execute(
+                    update(Task)
+                    .where(Task.id == task_id)
+                    .values(status=TaskStatus.RUNNING, started_at=started)
+                )
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+        assert reaped == 2
+
+        with_msg = pq.get_task(with_override).error or ""  # type: ignore[union-attr]
+        without_msg = pq.get_task(without_override).error or ""  # type: ignore[union-attr]
+
+        # Both messages start with the common prefix.
+        assert "Reaped: task still RUNNING" in with_msg
+        assert "Reaped: task still RUNNING" in without_msg
+
+        # Per-row max_runtime_seconds value appears in each. Substrings
+        # anchored with trailing punctuation so ``"=300"`` doesn't also
+        # match ``"=3000"`` (defends against a future refactor that
+        # changes the per-task multiplier from 2× to e.g. 3×).
+        assert "max_runtime_seconds=300," in with_msg, (
+            f"expected 'max_runtime_seconds=300,' in {with_msg!r}"
+        )
+        assert "max_runtime_seconds=NULL," in without_msg, (
+            f"expected 'max_runtime_seconds=NULL,' in {without_msg!r}"
+        )
+
+        # Effective threshold reflects the reaper math: with-override
+        # got max(3600, 600)=3600 s; without-override got 3600 s default.
+        # Anchor with trailing " s)" to prevent ``"=3600"`` matching
+        # ``"=36000"`` in any future format change.
+        assert "effective threshold=3600 s)" in with_msg
+        assert "effective threshold=3600 s)" in without_msg
+
+
+class TestMigrationAppliesOnPopulatedTables:
+    """Verifies the ``aee3e8e7e647`` migration applies cleanly to
+    already-populated ``pq_tasks`` and ``pq_periodic`` tables and
+    leaves all existing rows intact with NULL in the new column.
+
+    This is the deployment-time scenario: production pq_tasks already
+    has thousands of rows (the worker fleet is running, customers are
+    enqueueing) when the migration runs. The migration must not lose
+    or rewrite data.
+    """
+
+    def test_migration_downgrade_then_upgrade_preserves_rows(
+        self, pq: PQ, db_url: str
+    ) -> None:
+        from alembic import command
+        from alembic.config import Config
+        import importlib.resources
+
+        from pq.models import TaskStatus
+
+        migrations_pkg = importlib.resources.files("pq.migrations")
+        cfg = Config()
+        cfg.set_main_option("script_location", str(migrations_pkg))
+        cfg.set_main_option("sqlalchemy.url", db_url)
+
+        # The ``pq`` fixture uses ``create_tables()`` (which bypasses
+        # Alembic), so the ``pq_schema_version`` tracking table doesn't
+        # exist yet. Stamp at head so the migration history matches the
+        # schema before we exercise the downgrade → upgrade cycle.
+        command.stamp(cfg, "head")
+
+        # The schema gets downgraded mid-test. Wrap the whole flow in
+        # try/finally so a failed assertion below doesn't leave the
+        # shared test database (per-session, not per-test) without the
+        # ``max_runtime_seconds`` column — that would cascade-fail every
+        # subsequent test in the suite that touches pq_tasks / pq_periodic.
+        try:
+            # Downgrade past our migration — simulates a production database
+            # at the previous head before this PR is deployed.
+            command.downgrade(cfg, "-1")
+
+            # Insert rows under the OLD schema (no max_runtime_seconds
+            # column). Real-world deployment shape — production already
+            # has thousands of rows when the migration is applied. Use
+            # raw SQL with the enum NAMES (``'PENDING'``) because the
+            # Postgres enum stores names not values (see
+            # ``initial_schema`` migration: ``sa.Enum("PENDING", ...)``).
+            from sqlalchemy import text
+
+            with pq.session() as session:
+                session.execute(
+                    text(
+                        "INSERT INTO pq_tasks (name, payload, priority, status,"
+                        " run_at, client_id, attempts) VALUES (:name,"
+                        " '{}'::jsonb, 50, 'PENDING', now(), :client_id, 0)"
+                    ),
+                    {"name": "tests.dummy", "client_id": "during-old-schema"},
+                )
+                session.execute(
+                    text(
+                        "INSERT INTO pq_periodic (name, key, payload, priority,"
+                        " run_every, next_run, client_id, active) VALUES"
+                        " (:name, '', '{}'::jsonb, 50, '1 hour'::interval,"
+                        " now(), :client_id, true)"
+                    ),
+                    {"name": "tests.dummy", "client_id": "during-old-schema-p"},
+                )
+
+            # Upgrade again — the real production migration path.
+            command.upgrade(cfg, "head")
+
+            # Rows seeded under the old schema must survive intact AND
+            # now have a NULL value in the newly-added column. NULL is
+            # exactly what the worker treats as "use my configured
+            # default", so the migration is backwards-compatible by
+            # construction.
+            from sqlalchemy import select
+
+            with pq.session() as session:
+                old_task = session.execute(
+                    select(Task).where(Task.client_id == "during-old-schema")
+                ).scalar_one()
+                assert old_task.max_runtime_seconds is None
+                assert old_task.status == TaskStatus.PENDING
+
+                old_periodic = session.execute(
+                    select(Periodic).where(Periodic.client_id == "during-old-schema-p")
+                ).scalar_one()
+                assert old_periodic.max_runtime_seconds is None
+
+            # And the override mechanic works post-upgrade — proves
+            # the column wasn't just added but is actually wired into
+            # enqueue.
+            new_id = pq.enqueue(
+                dummy_handler, max_runtime_seconds=999.0, client_id="post-migration"
+            )
+            with pq.session() as session:
+                new_task = session.get(Task, new_id)
+                assert new_task is not None
+                assert new_task.max_runtime_seconds == 999.0
+        finally:
+            # Belt-and-braces: even if any assertion above raised, push
+            # the schema back to head before this test releases its
+            # session. Subsequent tests assume head schema.
+            command.upgrade(cfg, "head")
