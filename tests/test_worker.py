@@ -103,7 +103,7 @@ async def tracked_slow_async_handler() -> None:
     """Slow async handler that appends ``"completed"`` to shared state
     only AFTER the sleep finishes.
 
-    Tests of "the per-task ``max_runtime`` killed the execution" assert
+    Tests of "the per-task ``max_runtime_seconds`` killed the execution" assert
     the absence of this marker — if the worker honoured the override
     (e.g. 1 s cap), ``asyncio.wait_for`` cancels the coroutine before
     the append; if it ignored the override and let the 10 s sleep
@@ -997,7 +997,7 @@ class TestConcurrentWorker:
         assert len(pq.list_completed()) == 3
 
     def test_timeout_concurrent(self, pq: PQ, db_url: str) -> None:
-        """Task exceeding max_runtime is killed and marked failed."""
+        """Task exceeding max_runtime_seconds is killed and marked failed."""
         pq.enqueue(slow_sync_handler)  # sleeps 10s
 
         pid, _ = self._run_concurrent_worker(db_url, max_runtime=1)
@@ -1167,7 +1167,7 @@ class TestConcurrentWorker:
         assert len(pq.list_completed()) == 1
 
     # ------------------------------------------------------------------
-    # Per-task max_runtime override — concurrent paths
+    # Per-task max_runtime_seconds override — concurrent paths
     # ------------------------------------------------------------------
     # Cover the ``_claim_and_fork_one_off`` and ``_claim_and_fork_periodic``
     # code paths (``worker.py:844, 933``) which mirror the sequential
@@ -1180,9 +1180,9 @@ class TestConcurrentWorker:
     def test_one_off_per_task_max_runtime_honored_concurrent(
         self, pq: PQ, db_url: str
     ) -> None:
-        """Per-task ``max_runtime=1`` kills a slow task even when the
+        """Per-task ``max_runtime_seconds=1`` kills a slow task even when the
         concurrent worker's own default is loose (60 s)."""
-        pq.enqueue(slow_sync_handler, max_runtime=1)
+        pq.enqueue(slow_sync_handler, max_runtime_seconds=1)
 
         pid, _ = self._run_concurrent_worker(db_url, max_runtime=60)
         self._wait_for(lambda: len(pq.list_failed()) >= 1, timeout=15)
@@ -1209,7 +1209,7 @@ class TestConcurrentWorker:
         ABSENCE of the post-sleep marker — direct proof the kill
         happened. ``last_run`` alone is set by the worker before the
         fork (Phase 1), so it doesn't differentiate "killed by
-        per-task max_runtime" from "ran to completion"."""
+        per-task max_runtime_seconds" from "ran to completion"."""
         from sqlalchemy import select
 
         results = manager.list()
@@ -1218,7 +1218,7 @@ class TestConcurrentWorker:
         pq.schedule(
             tracked_slow_async_handler,
             run_every=timedelta(seconds=60),
-            max_runtime=1.0,
+            max_runtime_seconds=1.0,
         )
 
         pid, _ = self._run_concurrent_worker(db_url, max_runtime=60)
@@ -1243,7 +1243,7 @@ class TestConcurrentWorker:
         self._stop_worker(pid)
 
         assert list(results) == [], (
-            f"per-task max_runtime=1.0 on the concurrent periodic path "
+            f"per-task max_runtime_seconds=1.0 on the concurrent periodic path "
             f"should have killed the handler before its 10 s sleep "
             f"finished; got results={list(results)} (handler ran to "
             f"completion → override was ignored)"
@@ -1327,7 +1327,7 @@ class TestPerTaskMaxRuntimeEnforcement:
     def test_one_off_async_task_uses_per_task_max_runtime(self, pq: PQ) -> None:
         """Per-task override TIGHTER than worker default kills the task."""
         # Worker default = 30s, per-task = 0.1s → killed at 0.1s.
-        pq.enqueue(slow_async_handler, max_runtime=0.1)
+        pq.enqueue(slow_async_handler, max_runtime_seconds=0.1)
         pq.run_worker_once(max_runtime=30)
         assert pq.pending_count() == 0  # task processed (and failed)
 
@@ -1335,7 +1335,7 @@ class TestPerTaskMaxRuntimeEnforcement:
         """Same as above for sync handlers (SIGALRM path)."""
         # SIGALRM has 1-second granularity; use 1s for the override
         # and 60s for the worker default.
-        pq.enqueue(slow_sync_handler, max_runtime=1)
+        pq.enqueue(slow_sync_handler, max_runtime_seconds=1)
         pq.run_worker_once(max_runtime=60)
         assert pq.pending_count() == 0
 
@@ -1357,12 +1357,12 @@ class TestPerTaskMaxRuntimeEnforcement:
         sized for short tasks lets one occasionally-long task opt out
         of the tight ceiling."""
         # Worker default = 0.5s. Fast handler completes in ~0s; we
-        # pass max_runtime=10 just to prove the override is honoured
+        # pass max_runtime_seconds=10 just to prove the override is honoured
         # (else the task would be killed even though it's fast — no:
         # fast tasks aren't affected by either ceiling; what we're
         # really proving is the column is consumed by the right code
         # path without breaking happy-path execution).
-        pq.enqueue(noop_handler, max_runtime=10.0)
+        pq.enqueue(noop_handler, max_runtime_seconds=10.0)
         result = pq.run_worker_once(max_runtime=0.5)
         assert result is True  # task was processed
         assert pq.pending_count() == 0
@@ -1389,12 +1389,12 @@ class TestPerTaskMaxRuntimeEnforcement:
         pq.schedule(
             tracked_slow_async_handler,
             run_every=timedelta(seconds=60),
-            max_runtime=0.1,
+            max_runtime_seconds=0.1,
         )
         pq.run_worker_once(max_runtime=30)
 
         assert list(results) == [], (
-            f"per-task max_runtime=0.1 should have killed the handler "
+            f"per-task max_runtime_seconds=0.1 should have killed the handler "
             f"before its 10 s sleep finished; got results={list(results)}"
         )
 
@@ -1441,7 +1441,7 @@ class TestPerTaskMaxRuntimeEnforcement:
             db_url=db_url,
             run_every=timedelta(seconds=60),
             max_concurrent=1,
-            max_runtime=120.0,
+            max_runtime_seconds=120.0,
         )
         pq.run_worker_once(max_runtime=30.0)
 

@@ -782,11 +782,11 @@ class TestReapStaleTasks:
 
 
 class TestMaxRuntimeOverrideValidation:
-    """``max_runtime <= 0`` is rejected at the call site.
+    """``max_runtime_seconds <= 0`` is rejected at the call site.
 
-    Why fail fast: ``signal.alarm(int(max_runtime) + 1)`` would fire at
+    Why fail fast: ``signal.alarm(int(max_runtime_seconds) + 1)`` would fire at
     1 s for ``0`` and at 0 s (disabling the alarm) for negative integer
-    ≥ -1; ``max_runtime * 2`` in the reaper would make the per-row
+    ≥ -1; ``max_runtime_seconds * 2`` in the reaper would make the per-row
     threshold a no-op silently; periodic ``lock_duration``'s ``≤ 0``
     fallback to 3600 s is for the worker-level default, not a caller
     contract. None of these are useful behaviours to expose, so the
@@ -797,8 +797,8 @@ class TestMaxRuntimeOverrideValidation:
     def test_enqueue_rejects_non_positive_max_runtime(
         self, pq: PQ, bad_value: float
     ) -> None:
-        with pytest.raises(ValueError, match=r"max_runtime must be > 0"):
-            pq.enqueue(dummy_handler, max_runtime=bad_value)
+        with pytest.raises(ValueError, match=r"max_runtime_seconds must be > 0"):
+            pq.enqueue(dummy_handler, max_runtime_seconds=bad_value)
 
     @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
     def test_enqueue_rejects_non_finite_max_runtime(
@@ -807,27 +807,29 @@ class TestMaxRuntimeOverrideValidation:
         """NaN and ±infinity bypass the ``<= 0`` check (``nan <= 0`` is
         False, ``inf <= 0`` is False), but neither produces useful
         worker behaviour — ``signal.alarm`` raises on NaN/inf, the
-        reaper's ``max_runtime * 2`` SQL produces NaN/NULL, etc.
+        reaper's ``max_runtime_seconds * 2`` SQL produces NaN/NULL, etc.
         Reject up front so the bug stays at the call site."""
         with pytest.raises(ValueError, match=r"must be a finite positive"):
-            pq.enqueue(dummy_handler, max_runtime=bad_value)
+            pq.enqueue(dummy_handler, max_runtime_seconds=bad_value)
 
     @pytest.mark.parametrize("bad_value", [0, -1])
     def test_upsert_rejects_non_positive_max_runtime(
         self, pq: PQ, bad_value: float
     ) -> None:
-        with pytest.raises(ValueError, match=r"max_runtime must be > 0"):
-            pq.upsert(dummy_handler, max_runtime=bad_value, client_id="reject-ups")
+        with pytest.raises(ValueError, match=r"max_runtime_seconds must be > 0"):
+            pq.upsert(
+                dummy_handler, max_runtime_seconds=bad_value, client_id="reject-ups"
+            )
 
     @pytest.mark.parametrize("bad_value", [0, -1])
     def test_schedule_rejects_non_positive_max_runtime(
         self, pq: PQ, bad_value: float
     ) -> None:
-        with pytest.raises(ValueError, match=r"max_runtime must be > 0"):
+        with pytest.raises(ValueError, match=r"max_runtime_seconds must be > 0"):
             pq.schedule(
                 cleanup_handler,
                 run_every=timedelta(hours=1),
-                max_runtime=bad_value,
+                max_runtime_seconds=bad_value,
             )
 
     def test_enqueue_accepts_tiny_positive_max_runtime(self, pq: PQ) -> None:
@@ -835,7 +837,7 @@ class TestMaxRuntimeOverrideValidation:
         validator. Acceptance is the contract; the worker's
         ``signal.alarm`` resolution floor is a separate concern
         (documented on the worker)."""
-        task_id = pq.enqueue(dummy_handler, max_runtime=0.001)
+        task_id = pq.enqueue(dummy_handler, max_runtime_seconds=0.001)
         with pq.session() as session:
             task = session.get(Task, task_id)
             assert task is not None
@@ -844,7 +846,7 @@ class TestMaxRuntimeOverrideValidation:
     def test_enqueue_accepts_none_explicitly(self, pq: PQ) -> None:
         """``None`` is the contract for 'use worker default' and must
         NOT raise — verifies the validator's early-return path."""
-        task_id = pq.enqueue(dummy_handler, max_runtime=None)
+        task_id = pq.enqueue(dummy_handler, max_runtime_seconds=None)
         with pq.session() as session:
             task = session.get(Task, task_id)
             assert task is not None
@@ -852,7 +854,7 @@ class TestMaxRuntimeOverrideValidation:
 
 
 class TestMaxRuntimeOverridePersistence:
-    """Tests for per-task ``max_runtime`` override storage.
+    """Tests for per-task ``max_runtime_seconds`` override storage.
 
     Verifies that ``Client.enqueue``, ``Client.upsert`` and ``Client.schedule``
     correctly persist the new ``max_runtime_seconds`` column on the
@@ -863,7 +865,7 @@ class TestMaxRuntimeOverridePersistence:
 
     def test_enqueue_persists_max_runtime_seconds(self, pq: PQ) -> None:
         task_id = pq.enqueue(
-            dummy_handler, max_runtime=172_800.0, client_id="override-enq-1"
+            dummy_handler, max_runtime_seconds=172_800.0, client_id="override-enq-1"
         )
         with pq.session() as session:
             task = session.get(Task, task_id)
@@ -882,7 +884,7 @@ class TestMaxRuntimeOverridePersistence:
 
     def test_upsert_persists_max_runtime_seconds(self, pq: PQ) -> None:
         task_id = pq.upsert(
-            dummy_handler, max_runtime=3600.0, client_id="override-ups-1"
+            dummy_handler, max_runtime_seconds=3600.0, client_id="override-ups-1"
         )
         with pq.session() as session:
             task = session.get(Task, task_id)
@@ -895,10 +897,10 @@ class TestMaxRuntimeOverridePersistence:
         can be replaced AND that re-upserting with ``None`` clears it
         back to NULL (so the same call site can opt-out later)."""
         first_id = pq.upsert(
-            dummy_handler, max_runtime=10.0, client_id="override-ups-conflict"
+            dummy_handler, max_runtime_seconds=10.0, client_id="override-ups-conflict"
         )
         second_id = pq.upsert(
-            dummy_handler, max_runtime=999.0, client_id="override-ups-conflict"
+            dummy_handler, max_runtime_seconds=999.0, client_id="override-ups-conflict"
         )
         assert first_id == second_id
         with pq.session() as session:
@@ -919,7 +921,7 @@ class TestMaxRuntimeOverridePersistence:
         periodic_id = pq.schedule(
             cleanup_handler,
             run_every=timedelta(hours=1),
-            max_runtime=7200.0,
+            max_runtime_seconds=7200.0,
             client_id="override-sched-1",
         )
         with pq.session() as session:
@@ -944,13 +946,13 @@ class TestMaxRuntimeOverridePersistence:
         pq.schedule(
             cleanup_handler,
             run_every=timedelta(hours=1),
-            max_runtime=10.0,
+            max_runtime_seconds=10.0,
             key="override-sched-conflict",
         )
         pq.schedule(
             cleanup_handler,
             run_every=timedelta(hours=1),
-            max_runtime=999.0,
+            max_runtime_seconds=999.0,
             key="override-sched-conflict",
         )
         from sqlalchemy import select
@@ -987,7 +989,7 @@ class TestReapStaleTasksRespectsPerTaskOverride:
     """
 
     def test_does_not_reap_long_task_within_per_task_threshold(self, pq: PQ) -> None:
-        """Task with ``max_runtime=3600`` (1h) started 30 min ago is NOT
+        """Task with ``max_runtime_seconds=3600`` (1h) started 30 min ago is NOT
         reaped, even when the reaper's default threshold is 10 min.
         Pre-feature, the row would have been reaped (started_at + 10min
         already past)."""
@@ -995,7 +997,9 @@ class TestReapStaleTasksRespectsPerTaskOverride:
 
         from pq.models import TaskStatus
 
-        task_id = pq.enqueue(dummy_handler, max_runtime=3600.0, client_id="long-task-1")
+        task_id = pq.enqueue(
+            dummy_handler, max_runtime_seconds=3600.0, client_id="long-task-1"
+        )
         with pq.session() as session:
             session.execute(
                 update(Task)
@@ -1022,7 +1026,9 @@ class TestReapStaleTasksRespectsPerTaskOverride:
 
         from pq.models import TaskStatus
 
-        task_id = pq.enqueue(dummy_handler, max_runtime=60.0, client_id="long-task-2")
+        task_id = pq.enqueue(
+            dummy_handler, max_runtime_seconds=60.0, client_id="long-task-2"
+        )
         # 60s budget × 2 = 120s threshold; started_at was 10 min ago.
         with pq.session() as session:
             session.execute(
@@ -1083,7 +1089,9 @@ class TestReapStaleTasksRespectsPerTaskOverride:
 
         # Tiny per-task budget (10s, so 2× = 20s) but default threshold
         # is 1h. Effective per-row = max(1h, 20s) = 1h.
-        task_id = pq.enqueue(dummy_handler, max_runtime=10.0, client_id="tiny-override")
+        task_id = pq.enqueue(
+            dummy_handler, max_runtime_seconds=10.0, client_id="tiny-override"
+        )
         with pq.session() as session:
             session.execute(
                 update(Task)
@@ -1114,11 +1122,11 @@ class TestReapStaleTasksRespectsPerTaskOverride:
         # All started 30 min ago.
         started = datetime.now(UTC) - timedelta(minutes=30)
         long_task = pq.enqueue(
-            dummy_handler, max_runtime=3600.0, client_id="mixed-long"
+            dummy_handler, max_runtime_seconds=3600.0, client_id="mixed-long"
         )
         null_task = pq.enqueue(dummy_handler, client_id="mixed-null")
         short_task = pq.enqueue(
-            dummy_handler, max_runtime=60.0, client_id="mixed-short"
+            dummy_handler, max_runtime_seconds=60.0, client_id="mixed-short"
         )
         with pq.session() as session:
             for task_id in (long_task, null_task, short_task):
@@ -1155,7 +1163,7 @@ class TestReapStaleTasksRespectsPerTaskOverride:
 
         started = datetime.now(UTC) - timedelta(hours=4)
         with_override = pq.enqueue(
-            dummy_handler, max_runtime=300.0, client_id="msg-with"
+            dummy_handler, max_runtime_seconds=300.0, client_id="msg-with"
         )
         without_override = pq.enqueue(dummy_handler, client_id="msg-without")
         with pq.session() as session:
@@ -1289,7 +1297,7 @@ class TestMigrationAppliesOnPopulatedTables:
             # the column wasn't just added but is actually wired into
             # enqueue.
             new_id = pq.enqueue(
-                dummy_handler, max_runtime=999.0, client_id="post-migration"
+                dummy_handler, max_runtime_seconds=999.0, client_id="post-migration"
             )
             with pq.session() as session:
                 new_task = session.get(Task, new_id)
