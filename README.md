@@ -107,6 +107,17 @@ pq.upsert(send_email, to="a@b.com", client_id="welcome-email")
 pq.upsert(send_email, to="new@b.com", client_id="welcome-email")
 ```
 
+If the task is running, the new version is queued and runs after the current run ends. One `client_id` never runs twice at the same time. This lets a task schedule its own continuation:
+
+```python
+def backfill(offset: int) -> None:
+    more = process_rows(offset, limit=1000)
+    if more:
+        with PQ(DATABASE_URL) as client:
+            # Runs after this run ends, never next to it
+            client.upsert(backfill, offset=offset + 1000, client_id="backfill")
+```
+
 ## Periodic Tasks
 
 ### Intervals

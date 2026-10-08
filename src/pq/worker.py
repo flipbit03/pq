@@ -756,6 +756,56 @@ def run_worker_once(
     return False
 
 
+def _finish_one_off(
+    pq: PQ,
+    task_id: int,
+    name: str,
+    status: TaskStatus,
+    error_msg: str | None,
+) -> None:
+    """Record the end of a one-off run.
+
+    Only touches the row if it is still RUNNING, so a reaper's FAILED
+    verdict (or a cancel) is not overwritten. If an ``upsert()`` parked a
+    new version on the row while it ran (``Task.requeue``), the row is
+    re-queued as PENDING with that version instead of being closed. The
+    outcome of this run is then only in the worker log, the same as when
+    an upsert overwrites a COMPLETED or FAILED row.
+
+    ``FOR UPDATE`` serializes this read-then-write with a concurrent
+    ``upsert()``, whose ``ON CONFLICT DO UPDATE`` locks the same row: a
+    parked version is either seen here, or the upsert runs after this
+    commit and hits a non-RUNNING row, which it overwrites directly.
+    """
+    try:
+        with pq.session() as session:
+            task = session.execute(
+                select(Task)
+                .where(Task.id == task_id, Task.status == TaskStatus.RUNNING)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if task is None:
+                logger.warning(
+                    f"Task '{name}' (id={task_id}) was no longer RUNNING"
+                    " when the worker tried to record its result"
+                    " — likely reaped or canceled"
+                )
+                return
+            if task.requeue is not None:
+                logger.info(
+                    f"Task '{name}' (id={task_id}) ended as {status.value};"
+                    " re-queued with the version upserted while it ran"
+                )
+                task.apply_requeue()
+                return
+            task.status = status
+            task.completed_at = datetime.now(UTC)
+            if error_msg:
+                task.error = error_msg
+    except Exception as e:
+        logger.error(f"Error updating task status: {e}")
+
+
 def _process_one_off_task(
     pq: PQ,
     *,
@@ -869,27 +919,9 @@ def _process_one_off_task(
     elapsed = time.perf_counter() - start
 
     # Phase 3: Update task status (guarded — only if still RUNNING, so we
-    # don't overwrite a reaper's FAILED verdict for an orphaned task)
-    try:
-        with pq.session() as session:
-            values: dict[str, object] = {
-                "status": status,
-                "completed_at": datetime.now(UTC),
-            }
-            if error_msg:
-                values["error"] = error_msg
-            result = session.execute(
-                update(Task)
-                .where(Task.id == task_id, Task.status == TaskStatus.RUNNING)
-                .values(**values)
-            )
-            if result.rowcount == 0:
-                logger.warning(
-                    f"Task '{name}' (id={task_id}) was no longer RUNNING"
-                    " when Phase 3 tried to update — likely reaped"
-                )
-    except Exception as e:
-        logger.error(f"Error updating task status: {e}")
+    # don't overwrite a reaper's FAILED verdict for an orphaned task; and
+    # re-queued instead of closed if an upsert was parked on the row)
+    _finish_one_off(pq, task_id, name, status, error_msg)
 
     # Log result
     if status == TaskStatus.COMPLETED:
@@ -1128,15 +1160,7 @@ def _claim_and_fork_one_off(
         )
     except Exception as e:
         logger.error(f"Error starting task '{name}': {e}")
-        try:
-            with pq.session() as session:
-                t = session.get(Task, task_id)
-                if t:
-                    t.status = TaskStatus.FAILED
-                    t.completed_at = datetime.now(UTC)
-                    t.error = str(e)
-        except Exception as update_err:
-            logger.error(f"Error updating task status: {update_err}")
+        _finish_one_off(pq, task_id, name, TaskStatus.FAILED, str(e))
         return None
 
     return _ChildSlot(
@@ -1342,29 +1366,7 @@ def _reap_and_update(pq: PQ, slot: _ChildSlot) -> None:
         if result.exit_kind == "timeout":
             error_msg = f"Timed out after {elapsed:.3f} s"
 
-        try:
-            with pq.session() as session:
-                values: dict[str, object] = {
-                    "status": result.task_status,
-                    "completed_at": datetime.now(UTC),
-                }
-                if error_msg:
-                    values["error"] = error_msg
-                row_result = session.execute(
-                    update(Task)
-                    .where(
-                        Task.id == slot.task_id,
-                        Task.status == TaskStatus.RUNNING,
-                    )
-                    .values(**values)
-                )
-                if row_result.rowcount == 0:
-                    logger.warning(
-                        f"Task '{slot.name}' (id={slot.task_id}) was no longer"
-                        " RUNNING when reap tried to update — likely reaped"
-                    )
-        except Exception as e:
-            logger.error(f"Error updating task status: {e}")
+        _finish_one_off(pq, slot.task_id, slot.name, result.task_status, error_msg)
 
         if result.task_status == TaskStatus.COMPLETED:
             logger.debug(f"Task '{slot.name}' completed in {elapsed:.3f} s")

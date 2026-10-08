@@ -13,9 +13,9 @@ from croniter.croniter import CroniterBadCronError
 from loguru import logger
 import sqlalchemy as sa
 from sqlalchemy import create_engine, delete, func, select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import InstrumentedAttribute, sessionmaker
 
 from pq.models import Base, Periodic, Task, TaskStatus
 from pq.priority import Priority
@@ -230,6 +230,12 @@ class PQ:
         Behaves like enqueue(), but on conflict for client_id, updates all fields.
         Status resets to PENDING, attempts to 0, and timestamps are cleared.
 
+        If the existing task is RUNNING, it is not changed. The new version
+        is stored on the row and runs after the current run ends (the worker
+        or the stale reaper re-queues the row with it). A second upsert while
+        the row is still RUNNING replaces the stored version, so only the
+        latest one runs. One ``client_id`` never runs twice at the same time.
+
         Args:
             task: Callable function to execute.
             *args: Positional arguments to pass to the handler.
@@ -255,6 +261,31 @@ class PQ:
         if run_at is None:
             run_at = datetime.now(UTC)
 
+        # In ``ON CONFLICT DO UPDATE``, ``Task.<column>`` refers to the
+        # existing row. A RUNNING row keeps every column as it is (the run
+        # in progress keeps its payload, ``started_at``, ``attempts`` and
+        # ``max_runtime_seconds``); the new version is parked in
+        # ``requeue`` and applied when the run ends. Any other status gets
+        # the plain overwrite. All in one statement, so the decision is
+        # made under the row lock that ``ON CONFLICT`` takes.
+        running = Task.status == TaskStatus.RUNNING
+        requeue = {
+            "name": name,
+            "payload": payload,
+            "priority": int(priority),
+            "run_at": run_at.isoformat(),
+            "max_runtime_seconds": max_runtime_seconds,
+        }
+
+        def unless_running(
+            value: object, column: InstrumentedAttribute[Any]
+        ) -> sa.ColumnElement[Any]:
+            # ``sa.literal(..., column.type)`` binds the value through the
+            # column's type. Required for the ``task_status`` enum, which
+            # stores member names (``'PENDING'``): a bare enum member in a
+            # ``CASE`` would bind ``'pending'`` and fail.
+            return sa.case((running, column), else_=sa.literal(value, column.type))
+
         stmt = (
             insert(Task)
             .values(
@@ -269,16 +300,21 @@ class PQ:
             .on_conflict_do_update(
                 index_elements=["client_id"],
                 set_={
-                    "name": name,
-                    "payload": payload,
-                    "priority": priority,
-                    "status": TaskStatus.PENDING,
-                    "run_at": run_at,
-                    "max_runtime_seconds": max_runtime_seconds,
-                    "attempts": 0,
-                    "started_at": None,
-                    "completed_at": None,
-                    "error": None,
+                    "name": unless_running(name, Task.name),
+                    "payload": unless_running(payload, Task.payload),
+                    "priority": unless_running(int(priority), Task.priority),
+                    "status": unless_running(TaskStatus.PENDING, Task.status),
+                    "run_at": unless_running(run_at, Task.run_at),
+                    "max_runtime_seconds": unless_running(
+                        max_runtime_seconds, Task.max_runtime_seconds
+                    ),
+                    "attempts": unless_running(0, Task.attempts),
+                    "started_at": unless_running(None, Task.started_at),
+                    "completed_at": unless_running(None, Task.completed_at),
+                    "error": unless_running(None, Task.error),
+                    "requeue": sa.case(
+                        (running, sa.literal(requeue, JSONB)), else_=sa.null()
+                    ),
                 },
             )
             .returning(Task.id)
@@ -589,6 +625,10 @@ class PQ:
         process remains to update their status. This method detects those
         orphaned rows and transitions them to FAILED.
 
+        A stale row that holds a version parked by ``upsert()`` (see
+        ``Task.requeue``) is re-queued as PENDING with that version instead
+        of being failed, so the parked version is not lost.
+
         Tasks enqueued with a per-task ``max_runtime_seconds`` override get a
         proportionally larger reaper window: the effective threshold for
         a row is ``max(threshold, max_runtime_seconds * 2)``. This avoids
@@ -605,7 +645,7 @@ class PQ:
                 ``timedelta(seconds=max_runtime_seconds * 2)``.
 
         Returns:
-            Number of tasks reaped.
+            Number of tasks reaped (failed plus re-queued).
         """
         now = datetime.now(UTC)
         threshold_seconds = threshold.total_seconds()
@@ -649,6 +689,7 @@ class PQ:
                 .where(
                     Task.status == TaskStatus.RUNNING,
                     Task.started_at < stale_cutoff,
+                    Task.requeue.is_(None),
                 )
                 .values(
                     status=TaskStatus.FAILED,
@@ -669,7 +710,31 @@ class PQ:
                     f" started_at={started_at},"
                     f" max_runtime_seconds={max_runtime_seconds})"
                 )
-            return len(reaped)
+
+            # Stale rows with a parked upsert: re-queue them with the
+            # parked version. ``FOR UPDATE`` serializes with a concurrent
+            # ``upsert()`` (which may replace ``requeue``) and with the
+            # worker's own end-of-run update.
+            requeued = list(
+                session.execute(
+                    select(Task)
+                    .where(
+                        Task.status == TaskStatus.RUNNING,
+                        Task.started_at < stale_cutoff,
+                        Task.requeue.is_not(None),
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            for task in requeued:
+                logger.warning(
+                    f"Reaped stale task '{task.name}' (id={task.id},"
+                    f" started_at={task.started_at},"
+                    f" max_runtime_seconds={task.max_runtime_seconds});"
+                    " re-queued by a parked upsert"
+                )
+                task.apply_requeue()
+            return len(reaped) + len(requeued)
 
     def run_worker(
         self,

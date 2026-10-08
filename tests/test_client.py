@@ -231,6 +231,31 @@ class TestScheduleMaxConcurrent:
             ).scalar_one()
             assert periodic.max_concurrent == 1
 
+    def test_reschedule_does_not_clear_lock(self, pq: PQ) -> None:
+        """Calling ``schedule()`` again while an execution holds
+        ``locked_until`` keeps the lock (and ``last_run``)."""
+        from sqlalchemy import select, update
+
+        periodic_id = pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+        locked_until = datetime.now(UTC) + timedelta(minutes=10)
+        last_run = datetime.now(UTC)
+        with pq.session() as session:
+            session.execute(
+                update(Periodic)
+                .where(Periodic.id == periodic_id)
+                .values(locked_until=locked_until, last_run=last_run)
+            )
+
+        pq.schedule(cleanup_handler, full=True, run_every=timedelta(hours=2))
+
+        with pq.session() as session:
+            periodic = session.execute(
+                select(Periodic).where(Periodic.id == periodic_id)
+            ).scalar_one()
+            assert periodic.payload["kwargs"] == {"full": True}
+            assert periodic.locked_until == locked_until
+            assert periodic.last_run == last_run
+
 
 class TestScheduleActive:
     """Tests for active parameter in schedule."""
@@ -658,6 +683,143 @@ class TestUpsert:
         assert task_id > 0
 
 
+def _mark_running(pq: PQ, task_id: int, started_at: datetime | None = None) -> None:
+    """Simulate a worker claim: set the row RUNNING with ``attempts=1``."""
+    from sqlalchemy import update
+
+    from pq.models import TaskStatus
+
+    with pq.session() as session:
+        session.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status=TaskStatus.RUNNING,
+                started_at=started_at or datetime.now(UTC),
+                attempts=1,
+            )
+        )
+
+
+class TestUpsertWhileRunning:
+    """Upsert on a RUNNING row parks the new version in ``requeue``
+    instead of handing the row back to the queue (ricwo/pq#27)."""
+
+    def test_upsert_on_running_row_parks_new_version(self, pq: PQ) -> None:
+        """The run in progress keeps its row; the new version goes to ``requeue``."""
+        from pq.models import TaskStatus
+        from pq.priority import Priority
+        from pq.serialization import serialize
+
+        task_id = pq.upsert(
+            upsert_handler, value=1, client_id="running", max_runtime_seconds=600.0
+        )
+        _mark_running(pq, task_id)
+        before = pq.get_task(task_id)
+        assert before is not None
+
+        run_at = datetime.now(UTC) + timedelta(minutes=5)
+        returned_id = pq.upsert(
+            dummy_handler,
+            key="v2",
+            client_id="running",
+            priority=Priority.HIGH,
+            run_at=run_at,
+            max_runtime_seconds=30.0,
+        )
+
+        assert returned_id == task_id
+        task = pq.get_task(task_id)
+        assert task is not None
+        # The run in progress is untouched.
+        assert task.status == TaskStatus.RUNNING
+        assert task.name == before.name
+        assert task.payload == before.payload
+        assert task.priority == before.priority
+        assert task.run_at == before.run_at
+        assert task.attempts == 1
+        assert task.started_at == before.started_at
+        assert task.max_runtime_seconds == 600.0
+        # The new version is parked.
+        assert task.requeue == {
+            "name": "tests.test_client:dummy_handler",
+            "payload": serialize((), {"key": "v2"}),
+            "priority": Priority.HIGH.value,
+            "run_at": run_at.isoformat(),
+            "max_runtime_seconds": 30.0,
+        }
+        # Not claimable: nothing is PENDING.
+        assert pq.pending_count() == 0
+
+    def test_second_upsert_while_running_replaces_requeue(self, pq: PQ) -> None:
+        """The latest upsert wins."""
+        task_id = pq.upsert(upsert_handler, value=1, client_id="running")
+        _mark_running(pq, task_id)
+
+        pq.upsert(upsert_handler, value=2, client_id="running")
+        pq.upsert(upsert_handler, value=3, client_id="running")
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.payload["kwargs"] == {"value": 1}
+        assert task.requeue is not None
+        assert task.requeue["payload"]["kwargs"] == {"value": 3}
+
+    def test_upsert_on_pending_row_updates_in_place(self, pq: PQ) -> None:
+        """PENDING rows are overwritten directly, ``requeue`` stays NULL."""
+        from pq.models import TaskStatus
+
+        task_id = pq.upsert(upsert_handler, value=1, client_id="pending")
+        pq.upsert(upsert_handler, value=2, client_id="pending")
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.PENDING
+        assert task.payload["kwargs"] == {"value": 2}
+        assert task.requeue is None
+
+    @pytest.mark.parametrize(
+        ("handler", "expected_status"),
+        [
+            (dummy_handler, "completed"),
+            (failing_upsert_handler, "failed"),
+        ],
+    )
+    def test_upsert_on_finished_row_resets_to_pending(
+        self, pq: PQ, handler: object, expected_status: str
+    ) -> None:
+        """COMPLETED and FAILED rows reset to PENDING, ``requeue`` stays NULL."""
+        from pq.models import TaskStatus
+
+        assert callable(handler)
+        task_id = pq.upsert(handler, client_id="finished")
+        pq.run_worker_once()
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status.value == expected_status
+
+        pq.upsert(upsert_handler, value=7, client_id="finished")
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.PENDING
+        assert task.attempts == 0
+        assert task.started_at is None
+        assert task.completed_at is None
+        assert task.error is None
+        assert task.payload["kwargs"] == {"value": 7}
+        assert task.requeue is None
+
+    def test_enqueue_duplicate_client_id_still_raises(self, pq: PQ) -> None:
+        """``enqueue()`` is unchanged: a duplicate ``client_id`` raises,
+        also when the existing row is RUNNING."""
+        task_id = pq.enqueue(dummy_handler, client_id="dup")
+        _mark_running(pq, task_id)
+
+        with pytest.raises(IntegrityError):
+            pq.enqueue(dummy_handler, client_id="dup")
+
+
 class TestReapStaleTasks:
     """Tests for reap_stale_tasks method."""
 
@@ -779,6 +941,56 @@ class TestReapStaleTasks:
         reaped = pq.reap_stale_tasks(timedelta(hours=1))
 
         assert reaped == 0
+
+
+class TestReapStaleTasksWithParkedUpsert:
+    """The reaper re-queues a stale row that holds a parked upsert."""
+
+    def test_stale_row_with_requeue_is_requeued_not_failed(self, pq: PQ) -> None:
+        from pq.models import TaskStatus
+
+        stale_start = datetime.now(UTC) - timedelta(hours=2)
+
+        parked_id = pq.upsert(upsert_handler, value=1, client_id="parked")
+        _mark_running(pq, parked_id, started_at=stale_start)
+        pq.upsert(upsert_handler, value=2, client_id="parked", max_runtime_seconds=9.0)
+
+        plain_id = pq.upsert(upsert_handler, value=1, client_id="plain")
+        _mark_running(pq, plain_id, started_at=stale_start)
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+
+        assert reaped == 2
+
+        parked = pq.get_task(parked_id)
+        assert parked is not None
+        assert parked.status == TaskStatus.PENDING
+        assert parked.payload["kwargs"] == {"value": 2}
+        assert parked.max_runtime_seconds == 9.0
+        assert parked.attempts == 0
+        assert parked.started_at is None
+        assert parked.completed_at is None
+        assert parked.error is None
+        assert parked.requeue is None
+
+        plain = pq.get_task(plain_id)
+        assert plain is not None
+        assert plain.status == TaskStatus.FAILED
+        assert "Reaped" in (plain.error or "")
+
+    def test_recent_row_with_requeue_is_left_alone(self, pq: PQ) -> None:
+        from pq.models import TaskStatus
+
+        task_id = pq.upsert(upsert_handler, value=1, client_id="recent")
+        _mark_running(pq, task_id)
+        pq.upsert(upsert_handler, value=2, client_id="recent")
+
+        assert pq.reap_stale_tasks(timedelta(hours=1)) == 0
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        assert task.requeue is not None
 
 
 class TestMaxRuntimeOverrideValidation:
@@ -1242,7 +1454,7 @@ class TestMigrationAppliesOnPopulatedTables:
         try:
             # Downgrade past our migration — simulates a production database
             # at the previous head before this PR is deployed.
-            command.downgrade(cfg, "-1")
+            command.downgrade(cfg, "c3d4e5f6a7b8")
 
             # Insert rows under the OLD schema (no max_runtime_seconds
             # column). Real-world deployment shape — production already
@@ -1307,4 +1519,68 @@ class TestMigrationAppliesOnPopulatedTables:
             # Belt-and-braces: even if any assertion above raised, push
             # the schema back to head before this test releases its
             # session. Subsequent tests assume head schema.
+            command.upgrade(cfg, "head")
+
+
+class TestRequeueMigrationAppliesOnPopulatedTables:
+    """The ``d4e5f6a7b8c9`` migration (``pq_tasks.requeue``) applies on a
+    populated ``pq_tasks``, gives existing rows NULL, and downgrades
+    cleanly."""
+
+    def test_migration_downgrade_then_upgrade_preserves_rows(
+        self, pq: PQ, db_url: str
+    ) -> None:
+        from alembic import command
+        from alembic.config import Config
+        import importlib.resources
+
+        from sqlalchemy import inspect, select, text
+
+        from pq.models import TaskStatus
+
+        migrations_pkg = importlib.resources.files("pq.migrations")
+        cfg = Config()
+        cfg.set_main_option("script_location", str(migrations_pkg))
+        cfg.set_main_option("sqlalchemy.url", db_url)
+        command.stamp(cfg, "head")
+
+        def task_columns() -> set[str]:
+            with pq.session() as session:
+                return {
+                    column["name"]
+                    for column in inspect(session.connection()).get_columns("pq_tasks")
+                }
+
+        try:
+            command.downgrade(cfg, "aee3e8e7e647")
+            assert "requeue" not in task_columns()
+
+            with pq.session() as session:
+                session.execute(
+                    text(
+                        "INSERT INTO pq_tasks (name, payload, priority, status,"
+                        " run_at, client_id, attempts) VALUES (:name,"
+                        " '{}'::jsonb, 50, 'RUNNING', now(), :client_id, 1)"
+                    ),
+                    {"name": "tests.dummy", "client_id": "before-requeue"},
+                )
+
+            command.upgrade(cfg, "head")
+            assert "requeue" in task_columns()
+
+            with pq.session() as session:
+                old_task = session.execute(
+                    select(Task).where(Task.client_id == "before-requeue")
+                ).scalar_one()
+                assert old_task.requeue is None
+                assert old_task.status == TaskStatus.RUNNING
+                assert old_task.attempts == 1
+
+            # The column is wired into upsert after the upgrade.
+            pq.upsert(dummy_handler, key="next", client_id="before-requeue")
+            task = pq.get_task_by_client_id("before-requeue")
+            assert task is not None
+            assert task.requeue is not None
+            assert task.requeue["payload"]["kwargs"] == {"key": "next"}
+        finally:
             command.upgrade(cfg, "head")

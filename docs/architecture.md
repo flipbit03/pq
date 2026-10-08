@@ -59,6 +59,7 @@ pq.schedule(cleanup, run_every=timedelta(hours=1))
 | `status` | pending → running → completed/failed |
 | `run_at` | Scheduled execution time |
 | `error` | Error message if failed |
+| `requeue` | JSONB with the next version, stored by an `upsert()` that arrived while the task was running. Applied when the run ends |
 
 **`pq_periodic`** - Recurring schedules:
 
@@ -233,7 +234,10 @@ stateDiagram-v2
     PENDING --> RUNNING: worker claims
     RUNNING --> COMPLETED: success
     RUNNING --> FAILED: error/timeout/OOM
+    RUNNING --> PENDING: upsert parked while running
 ```
+
+`upsert()` on a RUNNING task does not change the run in progress. It stores the new version in `requeue`. When the run ends (success, failure, timeout, shutdown, or stale reap), the row goes back to PENDING with that version instead of COMPLETED or FAILED. So one `client_id` never runs twice at the same time.
 
 ## File Structure
 

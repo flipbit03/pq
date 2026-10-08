@@ -79,6 +79,33 @@ class Task(Base):
     # ``max_runtime_seconds * 2``). Useful for occasionally-long tasks
     # in a fleet whose default is sized for typical short work.
     max_runtime_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Next version of this task, parked by an ``upsert()`` that arrived while
+    # the row was RUNNING: name, payload, priority, run_at (ISO 8601) and
+    # max_runtime_seconds. Whoever ends the current run (worker or reaper)
+    # re-queues the row with it instead of closing the row. NULL when no
+    # upsert is parked (the common case).
+    requeue: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    def apply_requeue(self) -> None:
+        """Turn this RUNNING row into a fresh PENDING task from ``requeue``.
+
+        The caller must hold a row lock (``FOR UPDATE``) and guarantee
+        that ``requeue`` is not None.
+        """
+        spec = self.requeue
+        if spec is None:
+            raise ValueError(f"Task id={self.id} has no parked requeue version")
+        self.name = spec["name"]
+        self.payload = spec["payload"]
+        self.priority = spec["priority"]
+        self.run_at = datetime.fromisoformat(spec["run_at"])
+        self.max_runtime_seconds = spec["max_runtime_seconds"]
+        self.status = TaskStatus.PENDING
+        self.attempts = 0
+        self.started_at = None
+        self.completed_at = None
+        self.error = None
+        self.requeue = None
 
 
 class Periodic(Base):
