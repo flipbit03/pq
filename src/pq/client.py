@@ -234,7 +234,11 @@ class PQ:
         is stored on the row and runs after the current run ends (the worker
         or the stale reaper re-queues the row with it). A second upsert while
         the row is still RUNNING replaces the stored version, so only the
-        latest one runs. One ``client_id`` never runs twice at the same time.
+        latest one runs. One ``client_id`` does not run twice at the same
+        time, as long as the stale reaper's timeout is longer than the
+        longest run. If the worker running the task died, the stored version
+        runs only after the stale reaper re-queues the row: with the reaper
+        disabled (``stale_task_timeout=None``) it never runs.
 
         Args:
             task: Callable function to execute.
@@ -269,17 +273,27 @@ class PQ:
         # the plain overwrite. All in one statement, so the decision is
         # made under the row lock that ``ON CONFLICT`` takes.
         running = Task.status == TaskStatus.RUNNING
-        requeue = {
-            "name": name,
-            "payload": payload,
-            "priority": int(priority),
-            "run_at": run_at.isoformat(),
-            "max_runtime_seconds": max_runtime_seconds,
-        }
+        # ``run_at`` is added in SQL as ``timestamptz``, so Postgres
+        # serializes it as ISO 8601 with an offset. A naive ``run_at`` is
+        # then read in this session's time zone, the same as on the direct
+        # path, and not later in the session of whoever applies the version.
+        requeue = sa.literal(
+            {
+                "name": name,
+                "payload": payload,
+                "priority": int(priority),
+                "max_runtime_seconds": max_runtime_seconds,
+            },
+            JSONB,
+        ).op("||", return_type=JSONB)(
+            sa.func.jsonb_build_object(
+                "run_at", sa.cast(sa.literal(run_at), sa.DateTime(timezone=True))
+            )
+        )
 
-        def unless_running(
-            value: object, column: InstrumentedAttribute[Any]
-        ) -> sa.ColumnElement[Any]:
+        def unless_running[T](
+            value: T, column: InstrumentedAttribute[T]
+        ) -> sa.ColumnElement[T]:
             # ``sa.literal(..., column.type)`` binds the value through the
             # column's type. Required for the ``task_status`` enum, which
             # stores member names (``'PENDING'``): a bare enum member in a
@@ -312,9 +326,7 @@ class PQ:
                     "started_at": unless_running(None, Task.started_at),
                     "completed_at": unless_running(None, Task.completed_at),
                     "error": unless_running(None, Task.error),
-                    "requeue": sa.case(
-                        (running, sa.literal(requeue, JSONB)), else_=sa.null()
-                    ),
+                    "requeue": sa.case((running, requeue), else_=sa.null()),
                 },
             )
             .returning(Task.id)
@@ -618,7 +630,7 @@ class PQ:
             return result.rowcount
 
     def reap_stale_tasks(self, threshold: timedelta) -> int:
-        """Mark stale RUNNING tasks as FAILED.
+        """Mark stale RUNNING tasks as FAILED, or re-queue them.
 
         When a worker dies mid-execution (e.g. pod restart, OOM on the worker
         process), in-flight tasks stay RUNNING forever because no parent
@@ -752,7 +764,9 @@ class PQ:
         On SIGTERM or SIGINT the worker stops claiming new tasks, waits up
         to ``drain_timeout`` seconds for in-flight tasks to finish, then
         kills any still-running task and marks its row FAILED with an
-        explicit shutdown error. Interrupted tasks are not re-queued.
+        explicit shutdown error. Interrupted tasks are not re-queued,
+        unless an ``upsert()`` stored a new version while they ran: then the
+        row is re-queued with that version.
 
         Args:
             concurrency: Maximum number of tasks to process simultaneously.

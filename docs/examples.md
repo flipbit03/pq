@@ -163,7 +163,7 @@ for i in range(100):
 # Only the last message will be processed
 ```
 
-If the task is running, the new version is queued and runs after the current run ends. One `client_id` never runs twice at the same time. The run in progress is not changed. If several upserts arrive while it runs, only the last one runs next.
+If the task is running, the new version is queued and runs after the current run ends, so one `client_id` does not run twice at the same time. The run in progress is not changed. If several upserts arrive while it runs, only the last one runs next.
 
 This makes the "continuation" pattern safe: a task can upsert its own next slice under its own `client_id`, and the slice starts only after the current run has ended.
 
@@ -183,7 +183,7 @@ with PQ(DATABASE_URL) as pq:
     pq.upsert(backfill, offset=0, client_id="backfill")
 ```
 
-If the worker dies while the run is in progress, the stale-task reaper re-queues the row with the waiting version instead of marking it failed.
+If the worker dies while the run is in progress, the stale-task reaper re-queues the row with the waiting version instead of marking it failed. Until then (`stale_task_timeout`, default 1 hour) the waiting version does not run, and with the reaper disabled (`stale_task_timeout=None`) it never runs. Keep `stale_task_timeout` longer than your longest run: if the reaper picks up a run that is still alive, the waiting version can start next to it.
 
 ## Worker Lifecycle Hooks
 

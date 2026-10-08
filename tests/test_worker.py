@@ -1928,6 +1928,8 @@ class TestFinishOneOff:
 
     def test_requeues_row_with_parked_version(self, pq: PQ) -> None:
         """A FAILED run with a parked upsert re-queues the row instead."""
+        from sqlalchemy import text
+
         from pq.models import TaskStatus
         from pq.worker import _finish_one_off
 
@@ -1947,6 +1949,12 @@ class TestFinishOneOff:
         assert task.completed_at is None
         assert task.error is None
         assert task.requeue is None
+        with pq.session() as session:
+            is_null = session.execute(
+                text("SELECT requeue IS NULL FROM pq_tasks WHERE id = :id"),
+                {"id": task_id},
+            ).scalar_one()
+        assert is_null is True
 
     def test_records_result_without_parked_version(self, pq: PQ) -> None:
         from pq.models import TaskStatus

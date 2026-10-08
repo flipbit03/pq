@@ -83,8 +83,12 @@ class Task(Base):
     # the row was RUNNING: name, payload, priority, run_at (ISO 8601) and
     # max_runtime_seconds. Whoever ends the current run (worker or reaper)
     # re-queues the row with it instead of closing the row. NULL when no
-    # upsert is parked (the common case).
-    requeue: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # upsert is parked (the common case). ``none_as_null`` makes the ORM
+    # write SQL NULL for ``None`` (plain ``JSONB`` writes JSON ``null``,
+    # which ``IS NULL`` does not match).
+    requeue: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
 
     def apply_requeue(self) -> None:
         """Turn this RUNNING row into a fresh PENDING task from ``requeue``.

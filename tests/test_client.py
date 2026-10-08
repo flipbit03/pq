@@ -741,11 +741,13 @@ class TestUpsertWhileRunning:
         assert task.started_at == before.started_at
         assert task.max_runtime_seconds == 600.0
         # The new version is parked.
-        assert task.requeue == {
+        assert task.requeue is not None
+        parked = dict(task.requeue)
+        assert datetime.fromisoformat(parked.pop("run_at")) == run_at
+        assert parked == {
             "name": "tests.test_client:dummy_handler",
             "payload": serialize((), {"key": "v2"}),
             "priority": Priority.HIGH.value,
-            "run_at": run_at.isoformat(),
             "max_runtime_seconds": 30.0,
         }
         # Not claimable: nothing is PENDING.
@@ -764,6 +766,41 @@ class TestUpsertWhileRunning:
         assert task.payload["kwargs"] == {"value": 1}
         assert task.requeue is not None
         assert task.requeue["payload"]["kwargs"] == {"value": 3}
+
+    def test_parked_naive_run_at_matches_direct_upsert(
+        self, pq: PQ, db_url: str
+    ) -> None:
+        """A naive ``run_at`` gives the same instant whether it is applied
+        directly or parked and applied when the run ends, also when the
+        producer's session time zone differs from the worker's."""
+        from pq.models import TaskStatus
+        from pq.worker import _finish_one_off
+
+        naive_run_at = datetime(2030, 1, 2, 3, 4, 5, 678901)
+        producer_url = db_url + "&options=-c%20timezone%3DAmerica/Sao_Paulo"
+
+        with PQ(producer_url) as producer:
+            direct_id = producer.upsert(
+                dummy_handler, client_id="direct", run_at=naive_run_at
+            )
+            parked_id = producer.upsert(dummy_handler, client_id="parked")
+            started_at = datetime.now(UTC)
+            _mark_running(pq, parked_id, started_at=started_at)
+            producer.upsert(dummy_handler, client_id="parked", run_at=naive_run_at)
+
+        # The worker (``pq``, default session time zone) applies the version.
+        _finish_one_off(
+            pq, parked_id, started_at, "dummy_handler", TaskStatus.COMPLETED, None
+        )
+
+        direct = pq.get_task(direct_id)
+        parked = pq.get_task(parked_id)
+        assert direct is not None
+        assert parked is not None
+        assert parked.status == TaskStatus.PENDING
+        assert parked.run_at == direct.run_at
+        # Sanity: the producer's time zone was applied (not UTC).
+        assert direct.run_at != naive_run_at.replace(tzinfo=UTC)
 
     def test_upsert_on_pending_row_updates_in_place(self, pq: PQ) -> None:
         """PENDING rows are overwritten directly, ``requeue`` stays NULL."""
@@ -977,6 +1014,43 @@ class TestReapStaleTasksWithParkedUpsert:
         assert plain is not None
         assert plain.status == TaskStatus.FAILED
         assert "Reaped" in (plain.error or "")
+
+    def test_requeued_row_stores_sql_null(self, pq: PQ) -> None:
+        """After a re-queue, ``requeue`` is SQL NULL, not JSON ``null``
+        (which ``IS NULL`` would not match)."""
+        from sqlalchemy import text
+
+        task_id = pq.upsert(upsert_handler, value=1, client_id="sql-null")
+        _mark_running(pq, task_id, started_at=datetime.now(UTC) - timedelta(hours=2))
+        pq.upsert(upsert_handler, value=2, client_id="sql-null")
+        assert pq.reap_stale_tasks(timedelta(hours=1)) == 1
+
+        with pq.session() as session:
+            is_null = session.execute(
+                text("SELECT requeue IS NULL FROM pq_tasks WHERE id = :id"),
+                {"id": task_id},
+            ).scalar_one()
+        assert is_null is True
+
+    def test_previously_requeued_row_is_failed_when_stale_again(self, pq: PQ) -> None:
+        """A row re-queued from a parked version, claimed again and
+        orphaned again, is failed by the next reap (not re-queued twice)."""
+        from pq.models import TaskStatus
+
+        stale_start = datetime.now(UTC) - timedelta(hours=2)
+        task_id = pq.upsert(upsert_handler, value=1, client_id="twice")
+        _mark_running(pq, task_id, started_at=stale_start)
+        pq.upsert(upsert_handler, value=2, client_id="twice")
+        assert pq.reap_stale_tasks(timedelta(hours=1)) == 1
+
+        _mark_running(pq, task_id, started_at=stale_start)
+        assert pq.reap_stale_tasks(timedelta(hours=1)) == 1
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert task.payload["kwargs"] == {"value": 2}
+        assert "Reaped" in (task.error or "")
 
     def test_recent_row_with_requeue_is_left_alone(self, pq: PQ) -> None:
         from pq.models import TaskStatus

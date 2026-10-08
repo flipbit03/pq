@@ -234,10 +234,12 @@ stateDiagram-v2
     PENDING --> RUNNING: worker claims
     RUNNING --> COMPLETED: success
     RUNNING --> FAILED: error/timeout/OOM
-    RUNNING --> PENDING: upsert parked while running
+    RUNNING --> PENDING: run ends with a parked upsert
 ```
 
-`upsert()` on a RUNNING task does not change the run in progress. It stores the new version in `requeue`. When the run ends (success, failure, timeout, shutdown, or stale reap), the row goes back to PENDING with that version instead of COMPLETED or FAILED. So one `client_id` never runs twice at the same time.
+`upsert()` on a RUNNING task does not change the run in progress. It stores the new version in `requeue`. When the run ends (success, failure, timeout, shutdown, or stale reap), the row goes back to PENDING with that version instead of COMPLETED or FAILED. So one `client_id` does not run twice at the same time, as long as `stale_task_timeout` is longer than the longest run.
+
+The worker records the end of a run only if the row is still RUNNING with the `started_at` of that run's claim. A run that ends after its row was reaped (and maybe claimed again) leaves the row alone.
 
 ## File Structure
 

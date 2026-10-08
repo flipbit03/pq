@@ -572,7 +572,8 @@ def _maybe_reap_stale(
 
     Args:
         pq: PQ client instance.
-        stale_task_timeout: RUNNING tasks older than this are marked FAILED.
+        stale_task_timeout: RUNNING tasks older than this are marked FAILED
+            (or re-queued, if an upsert parked a new version on them).
             ``None`` disables reaping.
         reaper_interval: Seconds between reaper checks.
         last_reap: Mutable list containing last reap timestamp.
@@ -584,9 +585,15 @@ def _maybe_reap_stale(
     if now - last_reap[0] < reaper_interval:
         return
 
-    reaped = pq.reap_stale_tasks(stale_task_timeout)
-    if reaped:
-        logger.info(f"Reaped {reaped} stale RUNNING task(s)")
+    # A reaper error must not stop the worker loop (in concurrent mode that
+    # would also skip the drain of in-flight children). Retry next interval.
+    try:
+        reaped = pq.reap_stale_tasks(stale_task_timeout)
+    except Exception as e:
+        logger.error(f"Error reaping stale tasks: {e}")
+    else:
+        if reaped:
+            logger.info(f"Reaped {reaped} stale RUNNING task(s)")
 
     last_reap[0] = now
 
@@ -615,7 +622,9 @@ def run_worker(
     still-running task children and marks their rows FAILED with an explicit
     shutdown error. Interrupted tasks are NOT re-queued — pq's at-most-once
     semantics are preserved; applications that need redelivery must
-    re-enqueue such tasks themselves.
+    re-enqueue such tasks themselves. The one exception: if an ``upsert()``
+    stored a new version on the row while it ran, the row is re-queued with
+    that new version (the interrupted run itself is not retried).
 
     Args:
         pq: PQ client instance.
@@ -628,9 +637,12 @@ def run_worker(
         retention_days: Days to keep completed/failed tasks. Default: 7.
             Set to 0 to disable automatic cleanup.
         cleanup_interval: Seconds between cleanup runs. Default: 3600 (1 hour).
-        stale_task_timeout: Mark RUNNING tasks older than this as FAILED.
+        stale_task_timeout: Mark RUNNING tasks older than this as FAILED
+            (or re-queue them, if an upsert parked a new version on them).
             Catches orphaned tasks whose worker died mid-execution.
-            Default: 1 hour. Set to ``None`` to disable.
+            Default: 1 hour. Set to ``None`` to disable. Must be longer
+            than the longest run: a live run that is reaped can overlap
+            with the version re-queued after it.
         drain_timeout: Seconds to wait for in-flight tasks when shutting
             down on SIGTERM/SIGINT. Default: 20. Must be set below the
             orchestrator's termination grace period, with headroom for the
