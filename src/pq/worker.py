@@ -123,6 +123,9 @@ class _ChildSlot:
     name: str
     start_time: float
     is_periodic: bool
+    # ``started_at`` written by the claim of a one-off run. Identifies this
+    # run on the row (see ``_finish_one_off``). None for periodic slots.
+    started_at: datetime | None = None
     periodic_max_concurrent: int | None = None
 
 
@@ -759,14 +762,20 @@ def run_worker_once(
 def _finish_one_off(
     pq: PQ,
     task_id: int,
+    started_at: datetime | None,
     name: str,
     status: TaskStatus,
     error_msg: str | None,
 ) -> None:
     """Record the end of a one-off run.
 
-    Only touches the row if it is still RUNNING, so a reaper's FAILED
-    verdict (or a cancel) is not overwritten. If an ``upsert()`` parked a
+    Only touches the row if it is still RUNNING *with this run's*
+    ``started_at`` (the value written by its claim). So a reaper's FAILED
+    verdict (or a cancel) is not overwritten, and neither is a later run
+    of the same row: if the reaper re-queued the row while this run was
+    still alive and another worker claimed it, ``started_at`` no longer
+    matches. ``None`` never matches (a RUNNING row always has
+    ``started_at``), so the row is left alone. If an ``upsert()`` parked a
     new version on the row while it ran (``Task.requeue``), the row is
     re-queued as PENDING with that version instead of being closed. The
     outcome of this run is then only in the worker log, the same as when
@@ -781,13 +790,17 @@ def _finish_one_off(
         with pq.session() as session:
             task = session.execute(
                 select(Task)
-                .where(Task.id == task_id, Task.status == TaskStatus.RUNNING)
+                .where(
+                    Task.id == task_id,
+                    Task.status == TaskStatus.RUNNING,
+                    Task.started_at == started_at,
+                )
                 .with_for_update()
             ).scalar_one_or_none()
             if task is None:
                 logger.warning(
                     f"Task '{name}' (id={task_id}) was no longer RUNNING"
-                    " when the worker tried to record its result"
+                    " for this run when the worker tried to record its result"
                     " — likely reaped or canceled"
                 )
                 return
@@ -848,9 +861,11 @@ def _process_one_off_task(
             if task is None:
                 return False
 
-            # Mark as running
+            # Mark as running. ``started_at`` also identifies this run when
+            # Phase 3 records its result (see ``_finish_one_off``).
+            started_at = datetime.now(UTC)
             task.status = TaskStatus.RUNNING
-            task.started_at = datetime.now(UTC)
+            task.started_at = started_at
             task.attempts += 1
 
             # Get task data for execution (before session closes)
@@ -921,7 +936,7 @@ def _process_one_off_task(
     # Phase 3: Update task status (guarded — only if still RUNNING, so we
     # don't overwrite a reaper's FAILED verdict for an orphaned task; and
     # re-queued instead of closed if an upsert was parked on the row)
-    _finish_one_off(pq, task_id, name, status, error_msg)
+    _finish_one_off(pq, task_id, started_at, name, status, error_msg)
 
     # Log result
     if status == TaskStatus.COMPLETED:
@@ -1124,8 +1139,9 @@ def _claim_and_fork_one_off(
             if task is None:
                 return None
 
+            started_at = datetime.now(UTC)
             task.status = TaskStatus.RUNNING
-            task.started_at = datetime.now(UTC)
+            task.started_at = started_at
             task.attempts += 1
 
             name = task.name
@@ -1160,7 +1176,7 @@ def _claim_and_fork_one_off(
         )
     except Exception as e:
         logger.error(f"Error starting task '{name}': {e}")
-        _finish_one_off(pq, task_id, name, TaskStatus.FAILED, str(e))
+        _finish_one_off(pq, task_id, started_at, name, TaskStatus.FAILED, str(e))
         return None
 
     return _ChildSlot(
@@ -1170,6 +1186,7 @@ def _claim_and_fork_one_off(
         name=name,
         start_time=time.perf_counter(),
         is_periodic=False,
+        started_at=started_at,
     )
 
 
@@ -1366,7 +1383,14 @@ def _reap_and_update(pq: PQ, slot: _ChildSlot) -> None:
         if result.exit_kind == "timeout":
             error_msg = f"Timed out after {elapsed:.3f} s"
 
-        _finish_one_off(pq, slot.task_id, slot.name, result.task_status, error_msg)
+        _finish_one_off(
+            pq,
+            slot.task_id,
+            slot.started_at,
+            slot.name,
+            result.task_status,
+            error_msg,
+        )
 
         if result.task_status == TaskStatus.COMPLETED:
             logger.debug(f"Task '{slot.name}' completed in {elapsed:.3f} s")

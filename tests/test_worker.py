@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from pq.client import PQ
-from pq.models import Periodic
+from pq.models import Periodic, TaskStatus
 from pq.priority import Priority
 
 # Global shared state for fork-isolated tests
@@ -1885,33 +1885,58 @@ def continuation_handler(
 class TestFinishOneOff:
     """Unit tests for ``_finish_one_off``, the shared end-of-run update."""
 
-    def _running_task(self, pq: PQ) -> int:
+    def _claim(self, pq: PQ, task_id: int, started_at: datetime) -> None:
+        """Simulate a worker claim of the row with the given ``started_at``."""
         from sqlalchemy import update
 
         from pq.models import Task, TaskStatus
 
-        task_id = pq.upsert(capture_handler, value=1, client_id="finish")
         with pq.session() as session:
             session.execute(
                 update(Task)
                 .where(Task.id == task_id)
-                .values(
-                    status=TaskStatus.RUNNING,
-                    started_at=datetime.now(UTC),
-                    attempts=1,
-                )
+                .values(status=TaskStatus.RUNNING, started_at=started_at, attempts=1)
             )
-        return task_id
+
+    def _running_task(self, pq: PQ) -> tuple[int, datetime]:
+        task_id = pq.upsert(capture_handler, value=1, client_id="finish")
+        started_at = datetime.now(UTC)
+        self._claim(pq, task_id, started_at)
+        return task_id, started_at
+
+    def _finish_capturing_warnings(
+        self,
+        pq: PQ,
+        task_id: int,
+        started_at: datetime | None,
+        status: TaskStatus,
+        error_msg: str | None,
+    ) -> list[str]:
+        from loguru import logger
+
+        from pq.worker import _finish_one_off
+
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING", format="{message}")
+        try:
+            _finish_one_off(
+                pq, task_id, started_at, "capture_handler", status, error_msg
+            )
+        finally:
+            logger.remove(sink)
+        return messages
 
     def test_requeues_row_with_parked_version(self, pq: PQ) -> None:
         """A FAILED run with a parked upsert re-queues the row instead."""
         from pq.models import TaskStatus
         from pq.worker import _finish_one_off
 
-        task_id = self._running_task(pq)
+        task_id, started_at = self._running_task(pq)
         pq.upsert(capture_handler, value=2, client_id="finish")
 
-        _finish_one_off(pq, task_id, "capture_handler", TaskStatus.FAILED, "boom")
+        _finish_one_off(
+            pq, task_id, started_at, "capture_handler", TaskStatus.FAILED, "boom"
+        )
 
         task = pq.get_task(task_id)
         assert task is not None
@@ -1927,9 +1952,11 @@ class TestFinishOneOff:
         from pq.models import TaskStatus
         from pq.worker import _finish_one_off
 
-        task_id = self._running_task(pq)
+        task_id, started_at = self._running_task(pq)
 
-        _finish_one_off(pq, task_id, "capture_handler", TaskStatus.FAILED, "boom")
+        _finish_one_off(
+            pq, task_id, started_at, "capture_handler", TaskStatus.FAILED, "boom"
+        )
 
         task = pq.get_task(task_id)
         assert task is not None
@@ -1940,23 +1967,80 @@ class TestFinishOneOff:
 
     def test_leaves_non_running_row_alone(self, pq: PQ) -> None:
         """A row that is no longer RUNNING (reaped) is not overwritten."""
-        from loguru import logger
-
         from pq.models import TaskStatus
-        from pq.worker import _finish_one_off
 
         task_id = pq.upsert(capture_handler, value=1, client_id="finish")
-        messages: list[str] = []
-        sink = logger.add(messages.append, level="WARNING", format="{message}")
-        try:
-            _finish_one_off(pq, task_id, "capture_handler", TaskStatus.COMPLETED, None)
-        finally:
-            logger.remove(sink)
+
+        messages = self._finish_capturing_warnings(
+            pq, task_id, datetime.now(UTC), TaskStatus.COMPLETED, None
+        )
 
         task = pq.get_task(task_id)
         assert task is not None
         assert task.status == TaskStatus.PENDING
         assert task.completed_at is None
+        assert any("no longer RUNNING" in message for message in messages)
+
+    def test_leaves_later_run_of_the_row_alone(self, pq: PQ) -> None:
+        """A run that ends after its row was reaped, re-queued and claimed
+        again does not touch the later run (``started_at`` differs)."""
+        from datetime import timedelta
+
+        from pq.models import TaskStatus
+        from pq.worker import _finish_one_off
+
+        # Run 0 is alive but slow, with a parked version (value=2).
+        task_id = pq.upsert(capture_handler, value=1, client_id="finish")
+        run_0_started_at = datetime.now(UTC) - timedelta(hours=2)
+        self._claim(pq, task_id, run_0_started_at)
+        pq.upsert(capture_handler, value=2, client_id="finish")
+
+        # The reaper re-queues the row; another worker claims it (run 1)
+        # and gets its own parked version (value=3).
+        assert pq.reap_stale_tasks(timedelta(hours=1)) == 1
+        run_1_started_at = datetime.now(UTC)
+        self._claim(pq, task_id, run_1_started_at)
+        pq.upsert(capture_handler, value=3, client_id="finish")
+
+        # Run 0 ends late: it must not record its result on run 1, nor
+        # apply run 1's parked version.
+        messages = self._finish_capturing_warnings(
+            pq, task_id, run_0_started_at, TaskStatus.FAILED, "late"
+        )
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        assert task.started_at == run_1_started_at
+        assert task.payload["kwargs"] == {"value": 2}
+        assert task.error is None
+        assert task.requeue is not None
+        assert task.requeue["payload"]["kwargs"] == {"value": 3}
+        assert any("no longer RUNNING" in message for message in messages)
+
+        # Run 1 ends normally and re-queues the row with its parked version.
+        _finish_one_off(
+            pq, task_id, run_1_started_at, "capture_handler", TaskStatus.COMPLETED, None
+        )
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.PENDING
+        assert task.payload["kwargs"] == {"value": 3}
+        assert task.requeue is None
+
+    def test_none_started_at_never_matches(self, pq: PQ) -> None:
+        from pq.models import TaskStatus
+
+        task_id, started_at = self._running_task(pq)
+
+        messages = self._finish_capturing_warnings(
+            pq, task_id, None, TaskStatus.COMPLETED, None
+        )
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        assert task.started_at == started_at
         assert any("no longer RUNNING" in message for message in messages)
 
 
