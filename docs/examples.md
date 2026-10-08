@@ -163,6 +163,28 @@ for i in range(100):
 # Only the last message will be processed
 ```
 
+If the task is running, the new version is queued and runs after the current run ends, so one `client_id` does not run twice at the same time. The run in progress is not changed. If several upserts arrive while it runs, only the last one runs next.
+
+This makes the "continuation" pattern safe: a task can upsert its own next slice under its own `client_id`, and the slice starts only after the current run has ended.
+
+```python
+from pq import PQ
+
+DATABASE_URL = "postgresql://localhost/mydb"
+
+def backfill(offset: int) -> None:
+    more = process_rows(offset, limit=1000)
+    if more:
+        # Use a new client inside the task: the task runs in a forked process
+        with PQ(DATABASE_URL) as client:
+            client.upsert(backfill, offset=offset + 1000, client_id="backfill")
+
+with PQ(DATABASE_URL) as pq:
+    pq.upsert(backfill, offset=0, client_id="backfill")
+```
+
+If the worker dies while the run is in progress, the stale-task reaper re-queues the row with the waiting version instead of marking it failed. Until then (`stale_task_timeout`, default 1 hour) the waiting version does not run, and with the reaper disabled (`stale_task_timeout=None`) it never runs. Keep `stale_task_timeout` longer than your longest run: if the reaper picks up a run that is still alive, the waiting version can start next to it.
+
 ## Worker Lifecycle Hooks
 
 Use `pre_execute` and `post_execute` hooks to run code before/after task execution. Hooks run in the forked child process, making them ideal for fork-unsafe resources like OpenTelemetry.

@@ -107,6 +107,19 @@ pq.upsert(send_email, to="a@b.com", client_id="welcome-email")
 pq.upsert(send_email, to="new@b.com", client_id="welcome-email")
 ```
 
+If the task is running, the new version is queued and runs after the current run ends, so one `client_id` does not run twice at the same time. This lets a task schedule its own continuation:
+
+```python
+def backfill(offset: int) -> None:
+    more = process_rows(offset, limit=1000)
+    if more:
+        with PQ(DATABASE_URL) as client:
+            # Runs after this run ends, never next to it
+            client.upsert(backfill, offset=offset + 1000, client_id="backfill")
+```
+
+If the worker running the task dies, the queued version runs after the stale-task reaper picks up the row (`stale_task_timeout`, default 1 hour). Keep `stale_task_timeout` longer than your longest run: if the reaper picks up a run that is still alive, the queued version can start next to it.
+
 ## Periodic Tasks
 
 ### Intervals

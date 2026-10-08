@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from pq.client import PQ
-from pq.models import Periodic
+from pq.models import Periodic, TaskStatus
 from pq.priority import Priority
 
 # Global shared state for fork-isolated tests
@@ -1484,8 +1484,8 @@ def shutdown_probe_handler(duration: float, marker: str) -> None:
     _shared_results.append(marker)
 
 
-class TestGracefulShutdown:
-    """Tests for SIGTERM/SIGINT graceful drain (run_worker)."""
+class _ForkedWorkers:
+    """Helpers for tests that fork real ``run_worker`` processes."""
 
     @pytest.fixture(autouse=True)
     def _reap_leaked_workers(self) -> Generator[None, None, None]:
@@ -1580,6 +1580,10 @@ class TestGracefulShutdown:
         os.waitpid(pid, 0)
         self._worker_pids.remove(pid)
         raise AssertionError(f"Worker did not exit within {timeout}s")
+
+
+class TestGracefulShutdown(_ForkedWorkers):
+    """Tests for SIGTERM/SIGINT graceful drain (run_worker)."""
 
     def _task_running(self, pq: PQ, task_id: int) -> bool:
         task = pq.get_task(task_id)
@@ -1840,3 +1844,352 @@ class TestGracefulShutdown:
 def periodic_sleep_handler() -> None:
     """Periodic handler that sleeps long enough to straddle the drain."""
     time.sleep(30)
+
+
+CONTINUATION_CLIENT_ID = "continuation"
+
+
+def continuation_handler(
+    db_url: str, generation: int, delay: float, run_seconds: float
+) -> None:
+    """Run that upserts its own continuation under the same ``client_id``
+    while it is still RUNNING (the pattern from ricwo/pq#27).
+
+    Generation 0 upserts generation 1 (due in ``delay`` s), keeps running
+    for ``run_seconds``, then fails. Generation 1 runs for ``run_seconds``
+    and succeeds. Start and end times go to shared state.
+    """
+    from pq.client import PQ as PQClient
+
+    _shared_results.append((generation, "start", time.time()))
+    if generation == 0:
+        client = PQClient(db_url)
+        try:
+            client.upsert(
+                continuation_handler,
+                db_url=db_url,
+                generation=1,
+                delay=delay,
+                run_seconds=run_seconds,
+                client_id=CONTINUATION_CLIENT_ID,
+                run_at=datetime.now(UTC) + timedelta(seconds=delay),
+            )
+        finally:
+            client.close()
+    time.sleep(run_seconds)
+    _shared_results.append((generation, "end", time.time()))
+    if generation == 0:
+        raise RuntimeError("generation 0 failed after upserting its continuation")
+
+
+class TestFinishOneOff:
+    """Unit tests for ``_finish_one_off``, the shared end-of-run update."""
+
+    def _claim(self, pq: PQ, task_id: int, started_at: datetime) -> None:
+        """Simulate a worker claim of the row with the given ``started_at``."""
+        from sqlalchemy import update
+
+        from pq.models import Task, TaskStatus
+
+        with pq.session() as session:
+            session.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(status=TaskStatus.RUNNING, started_at=started_at, attempts=1)
+            )
+
+    def _running_task(self, pq: PQ) -> tuple[int, datetime]:
+        task_id = pq.upsert(capture_handler, value=1, client_id="finish")
+        started_at = datetime.now(UTC)
+        self._claim(pq, task_id, started_at)
+        return task_id, started_at
+
+    def _finish_capturing_warnings(
+        self,
+        pq: PQ,
+        task_id: int,
+        started_at: datetime | None,
+        status: TaskStatus,
+        error_msg: str | None,
+    ) -> list[str]:
+        from loguru import logger
+
+        from pq.worker import _finish_one_off
+
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING", format="{message}")
+        try:
+            _finish_one_off(
+                pq, task_id, started_at, "capture_handler", status, error_msg
+            )
+        finally:
+            logger.remove(sink)
+        return messages
+
+    def test_requeues_row_with_parked_version(self, pq: PQ) -> None:
+        """A FAILED run with a parked upsert re-queues the row instead."""
+        from sqlalchemy import text
+
+        from pq.models import TaskStatus
+        from pq.worker import _finish_one_off
+
+        task_id, started_at = self._running_task(pq)
+        pq.upsert(capture_handler, value=2, client_id="finish")
+
+        _finish_one_off(
+            pq, task_id, started_at, "capture_handler", TaskStatus.FAILED, "boom"
+        )
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.PENDING
+        assert task.payload["kwargs"] == {"value": 2}
+        assert task.attempts == 0
+        assert task.started_at is None
+        assert task.completed_at is None
+        assert task.error is None
+        assert task.requeue is None
+        with pq.session() as session:
+            is_null = session.execute(
+                text("SELECT requeue IS NULL FROM pq_tasks WHERE id = :id"),
+                {"id": task_id},
+            ).scalar_one()
+        assert is_null is True
+
+    def test_records_result_without_parked_version(self, pq: PQ) -> None:
+        from pq.models import TaskStatus
+        from pq.worker import _finish_one_off
+
+        task_id, started_at = self._running_task(pq)
+
+        _finish_one_off(
+            pq, task_id, started_at, "capture_handler", TaskStatus.FAILED, "boom"
+        )
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert task.error == "boom"
+        assert task.completed_at is not None
+        assert task.payload["kwargs"] == {"value": 1}
+
+    def test_leaves_non_running_row_alone(self, pq: PQ) -> None:
+        """A row that is no longer RUNNING (reaped) is not overwritten."""
+        from pq.models import TaskStatus
+
+        task_id = pq.upsert(capture_handler, value=1, client_id="finish")
+
+        messages = self._finish_capturing_warnings(
+            pq, task_id, datetime.now(UTC), TaskStatus.COMPLETED, None
+        )
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.PENDING
+        assert task.completed_at is None
+        assert any("no longer RUNNING" in message for message in messages)
+
+    def test_leaves_later_run_of_the_row_alone(self, pq: PQ) -> None:
+        """A run that ends after its row was reaped, re-queued and claimed
+        again does not touch the later run (``started_at`` differs)."""
+        from datetime import timedelta
+
+        from pq.models import TaskStatus
+        from pq.worker import _finish_one_off
+
+        # Run 0 is alive but slow, with a parked version (value=2).
+        task_id = pq.upsert(capture_handler, value=1, client_id="finish")
+        run_0_started_at = datetime.now(UTC) - timedelta(hours=2)
+        self._claim(pq, task_id, run_0_started_at)
+        pq.upsert(capture_handler, value=2, client_id="finish")
+
+        # The reaper re-queues the row; another worker claims it (run 1)
+        # and gets its own parked version (value=3).
+        assert pq.reap_stale_tasks(timedelta(hours=1)) == 1
+        run_1_started_at = datetime.now(UTC)
+        self._claim(pq, task_id, run_1_started_at)
+        pq.upsert(capture_handler, value=3, client_id="finish")
+
+        # Run 0 ends late: it must not record its result on run 1, nor
+        # apply run 1's parked version.
+        messages = self._finish_capturing_warnings(
+            pq, task_id, run_0_started_at, TaskStatus.FAILED, "late"
+        )
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        assert task.started_at == run_1_started_at
+        assert task.payload["kwargs"] == {"value": 2}
+        assert task.error is None
+        assert task.requeue is not None
+        assert task.requeue["payload"]["kwargs"] == {"value": 3}
+        assert any("no longer RUNNING" in message for message in messages)
+
+        # Run 1 ends normally and re-queues the row with its parked version.
+        _finish_one_off(
+            pq, task_id, run_1_started_at, "capture_handler", TaskStatus.COMPLETED, None
+        )
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.PENDING
+        assert task.payload["kwargs"] == {"value": 3}
+        assert task.requeue is None
+
+    def test_none_started_at_never_matches(self, pq: PQ) -> None:
+        from pq.models import TaskStatus
+
+        task_id, started_at = self._running_task(pq)
+
+        messages = self._finish_capturing_warnings(
+            pq, task_id, None, TaskStatus.COMPLETED, None
+        )
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        assert task.started_at == started_at
+        assert any("no longer RUNNING" in message for message in messages)
+
+
+class TestUpsertWhileRunning(_ForkedWorkers):
+    """Regression tests for ricwo/pq#27 with real forked workers: a run
+    that upserts its own continuation never overlaps with it, and the
+    end of one run never writes its status onto the next one."""
+
+    def _run_continuation(
+        self,
+        pq: PQ,
+        db_url: str,
+        manager: multiprocessing.managers.SyncManager,
+        log_path: Any,
+        *,
+        workers: int,
+        concurrency: int,
+        delay: float,
+        run_seconds: float = 1.0,
+        timeout: float = 15.0,
+    ) -> tuple[list[tuple[int, str, float]], list[str]]:
+        """Start the continuation chain and wait until generation 1 is
+        COMPLETED. Returns the handler events (sorted by time) and the
+        sequence of row statuses (consecutive duplicates collapsed, but
+        two different claims of the row count as two RUNNING entries)."""
+        import os
+        import signal as sig
+
+        from loguru import logger
+
+        _set_shared_results(manager.list())
+        sink = logger.add(log_path, level="INFO", format="{level} | {message}")
+        try:
+            task_id = pq.upsert(
+                continuation_handler,
+                db_url=db_url,
+                generation=0,
+                delay=delay,
+                run_seconds=run_seconds,
+                client_id=CONTINUATION_CLIENT_ID,
+            )
+            for _ in range(workers):
+                self._fork_worker(db_url, concurrency=concurrency)
+
+            statuses: list[str] = []
+            last_row: tuple[str, datetime | None] | None = None
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                task = pq.get_task(task_id)
+                assert task is not None
+                row = (task.status.value, task.started_at)
+                if row != last_row:
+                    statuses.append(task.status.value)
+                    last_row = row
+                if task.payload["kwargs"]["generation"] == 1 and (
+                    task.status.value in ("completed", "failed")
+                ):
+                    break
+                time.sleep(0.02)
+            else:
+                raise AssertionError(f"Chain did not finish; statuses={statuses}")
+        finally:
+            for pid in list(self._worker_pids):
+                os.kill(pid, sig.SIGTERM)
+            for pid in list(self._worker_pids):
+                self._wait_for_exit(pid)
+            logger.remove(sink)
+
+        events = sorted(_shared_results, key=lambda event: event[2])
+        return events, statuses
+
+    def _assert_no_overlap_and_final_state(
+        self, pq: PQ, events: list[tuple[int, str, float]], log_text: str
+    ) -> None:
+        from pq.models import TaskStatus
+
+        times = {(generation, kind): ts for generation, kind, ts in events}
+        assert set(times) == {(0, "start"), (0, "end"), (1, "start"), (1, "end")}, (
+            events
+        )
+        # Run 1 starts only after run 0 has ended.
+        assert times[(1, "start")] > times[(0, "end")], events
+
+        assert "no longer RUNNING" not in log_text, log_text
+        assert "re-queued with the version upserted while it ran" in log_text
+
+        final = pq.get_task_by_client_id(CONTINUATION_CLIENT_ID)
+        assert final is not None
+        assert final.status == TaskStatus.COMPLETED
+        assert final.payload["kwargs"]["generation"] == 1
+        assert final.error is None
+        assert final.requeue is None
+        assert final.attempts == 1
+
+    def test_continuation_due_now_two_workers(
+        self,
+        pq: PQ,
+        db_url: str,
+        manager: multiprocessing.managers.SyncManager,
+        tmp_path: Any,
+    ) -> None:
+        """Continuation due now, two sequential workers: no overlap, run 0's
+        FAILED never lands on run 1's row."""
+        log_path = tmp_path / "workers.log"
+        events, statuses = self._run_continuation(
+            pq, db_url, manager, log_path, workers=2, concurrency=1, delay=0.0
+        )
+
+        self._assert_no_overlap_and_final_state(pq, events, log_path.read_text())
+        assert "failed" not in statuses, statuses
+
+    def test_continuation_due_later_one_worker(
+        self,
+        pq: PQ,
+        db_url: str,
+        manager: multiprocessing.managers.SyncManager,
+        tmp_path: Any,
+    ) -> None:
+        """Continuation due in 2 s, one worker: the row goes RUNNING ->
+        PENDING (end of run 0) -> RUNNING -> COMPLETED, without a warning."""
+        log_path = tmp_path / "workers.log"
+        events, statuses = self._run_continuation(
+            pq, db_url, manager, log_path, workers=1, concurrency=1, delay=2.0
+        )
+
+        self._assert_no_overlap_and_final_state(pq, events, log_path.read_text())
+        assert statuses == ["pending", "running", "pending", "running", "completed"]
+
+    def test_continuation_due_now_concurrent_worker(
+        self,
+        pq: PQ,
+        db_url: str,
+        manager: multiprocessing.managers.SyncManager,
+        tmp_path: Any,
+    ) -> None:
+        """Continuation due now, one worker with ``concurrency=2``: covers
+        the ``_reap_and_update`` path. Still no overlap."""
+        log_path = tmp_path / "workers.log"
+        events, statuses = self._run_continuation(
+            pq, db_url, manager, log_path, workers=1, concurrency=2, delay=0.0
+        )
+
+        self._assert_no_overlap_and_final_state(pq, events, log_path.read_text())
+        assert "failed" not in statuses, statuses

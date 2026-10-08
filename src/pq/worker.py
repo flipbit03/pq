@@ -123,6 +123,9 @@ class _ChildSlot:
     name: str
     start_time: float
     is_periodic: bool
+    # ``started_at`` written by the claim of a one-off run. Identifies this
+    # run on the row (see ``_finish_one_off``). None for periodic slots.
+    started_at: datetime | None = None
     periodic_max_concurrent: int | None = None
 
 
@@ -569,7 +572,8 @@ def _maybe_reap_stale(
 
     Args:
         pq: PQ client instance.
-        stale_task_timeout: RUNNING tasks older than this are marked FAILED.
+        stale_task_timeout: RUNNING tasks older than this are marked FAILED
+            (or re-queued, if an upsert parked a new version on them).
             ``None`` disables reaping.
         reaper_interval: Seconds between reaper checks.
         last_reap: Mutable list containing last reap timestamp.
@@ -581,9 +585,15 @@ def _maybe_reap_stale(
     if now - last_reap[0] < reaper_interval:
         return
 
-    reaped = pq.reap_stale_tasks(stale_task_timeout)
-    if reaped:
-        logger.info(f"Reaped {reaped} stale RUNNING task(s)")
+    # A reaper error must not stop the worker loop (in concurrent mode that
+    # would also skip the drain of in-flight children). Retry next interval.
+    try:
+        reaped = pq.reap_stale_tasks(stale_task_timeout)
+    except Exception as e:
+        logger.error(f"Error reaping stale tasks: {e}")
+    else:
+        if reaped:
+            logger.info(f"Reaped {reaped} stale RUNNING task(s)")
 
     last_reap[0] = now
 
@@ -612,7 +622,9 @@ def run_worker(
     still-running task children and marks their rows FAILED with an explicit
     shutdown error. Interrupted tasks are NOT re-queued — pq's at-most-once
     semantics are preserved; applications that need redelivery must
-    re-enqueue such tasks themselves.
+    re-enqueue such tasks themselves. The one exception: if an ``upsert()``
+    stored a new version on the row while it ran, the row is re-queued with
+    that new version (the interrupted run itself is not retried).
 
     Args:
         pq: PQ client instance.
@@ -625,9 +637,12 @@ def run_worker(
         retention_days: Days to keep completed/failed tasks. Default: 7.
             Set to 0 to disable automatic cleanup.
         cleanup_interval: Seconds between cleanup runs. Default: 3600 (1 hour).
-        stale_task_timeout: Mark RUNNING tasks older than this as FAILED.
+        stale_task_timeout: Mark RUNNING tasks older than this as FAILED
+            (or re-queue them, if an upsert parked a new version on them).
             Catches orphaned tasks whose worker died mid-execution.
-            Default: 1 hour. Set to ``None`` to disable.
+            Default: 1 hour. Set to ``None`` to disable. Must be longer
+            than the longest run: a live run that is reaped can overlap
+            with the version re-queued after it.
         drain_timeout: Seconds to wait for in-flight tasks when shutting
             down on SIGTERM/SIGINT. Default: 20. Must be set below the
             orchestrator's termination grace period, with headroom for the
@@ -756,6 +771,66 @@ def run_worker_once(
     return False
 
 
+def _finish_one_off(
+    pq: PQ,
+    task_id: int,
+    started_at: datetime | None,
+    name: str,
+    status: TaskStatus,
+    error_msg: str | None,
+) -> None:
+    """Record the end of a one-off run.
+
+    Only touches the row if it is still RUNNING *with this run's*
+    ``started_at`` (the value written by its claim). So a reaper's FAILED
+    verdict (or a cancel) is not overwritten, and neither is a later run
+    of the same row: if the reaper re-queued the row while this run was
+    still alive and another worker claimed it, ``started_at`` no longer
+    matches. ``None`` never matches (a RUNNING row always has
+    ``started_at``), so the row is left alone. If an ``upsert()`` parked a
+    new version on the row while it ran (``Task.requeue``), the row is
+    re-queued as PENDING with that version instead of being closed. The
+    outcome of this run is then only in the worker log, the same as when
+    an upsert overwrites a COMPLETED or FAILED row.
+
+    ``FOR UPDATE`` serializes this read-then-write with a concurrent
+    ``upsert()``, whose ``ON CONFLICT DO UPDATE`` locks the same row: a
+    parked version is either seen here, or the upsert runs after this
+    commit and hits a non-RUNNING row, which it overwrites directly.
+    """
+    try:
+        with pq.session() as session:
+            task = session.execute(
+                select(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.status == TaskStatus.RUNNING,
+                    Task.started_at == started_at,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if task is None:
+                logger.warning(
+                    f"Task '{name}' (id={task_id}) was no longer RUNNING"
+                    " for this run when the worker tried to record its result"
+                    " — likely reaped or canceled"
+                )
+                return
+            if task.requeue is not None:
+                logger.info(
+                    f"Task '{name}' (id={task_id}) ended as {status.value};"
+                    " re-queued with the version upserted while it ran"
+                )
+                task.apply_requeue()
+                return
+            task.status = status
+            task.completed_at = datetime.now(UTC)
+            if error_msg:
+                task.error = error_msg
+    except Exception as e:
+        logger.error(f"Error updating task status: {e}")
+
+
 def _process_one_off_task(
     pq: PQ,
     *,
@@ -798,9 +873,11 @@ def _process_one_off_task(
             if task is None:
                 return False
 
-            # Mark as running
+            # Mark as running. ``started_at`` also identifies this run when
+            # Phase 3 records its result (see ``_finish_one_off``).
+            started_at = datetime.now(UTC)
             task.status = TaskStatus.RUNNING
-            task.started_at = datetime.now(UTC)
+            task.started_at = started_at
             task.attempts += 1
 
             # Get task data for execution (before session closes)
@@ -869,27 +946,9 @@ def _process_one_off_task(
     elapsed = time.perf_counter() - start
 
     # Phase 3: Update task status (guarded — only if still RUNNING, so we
-    # don't overwrite a reaper's FAILED verdict for an orphaned task)
-    try:
-        with pq.session() as session:
-            values: dict[str, object] = {
-                "status": status,
-                "completed_at": datetime.now(UTC),
-            }
-            if error_msg:
-                values["error"] = error_msg
-            result = session.execute(
-                update(Task)
-                .where(Task.id == task_id, Task.status == TaskStatus.RUNNING)
-                .values(**values)
-            )
-            if result.rowcount == 0:
-                logger.warning(
-                    f"Task '{name}' (id={task_id}) was no longer RUNNING"
-                    " when Phase 3 tried to update — likely reaped"
-                )
-    except Exception as e:
-        logger.error(f"Error updating task status: {e}")
+    # don't overwrite a reaper's FAILED verdict for an orphaned task; and
+    # re-queued instead of closed if an upsert was parked on the row)
+    _finish_one_off(pq, task_id, started_at, name, status, error_msg)
 
     # Log result
     if status == TaskStatus.COMPLETED:
@@ -1092,8 +1151,9 @@ def _claim_and_fork_one_off(
             if task is None:
                 return None
 
+            started_at = datetime.now(UTC)
             task.status = TaskStatus.RUNNING
-            task.started_at = datetime.now(UTC)
+            task.started_at = started_at
             task.attempts += 1
 
             name = task.name
@@ -1128,15 +1188,7 @@ def _claim_and_fork_one_off(
         )
     except Exception as e:
         logger.error(f"Error starting task '{name}': {e}")
-        try:
-            with pq.session() as session:
-                t = session.get(Task, task_id)
-                if t:
-                    t.status = TaskStatus.FAILED
-                    t.completed_at = datetime.now(UTC)
-                    t.error = str(e)
-        except Exception as update_err:
-            logger.error(f"Error updating task status: {update_err}")
+        _finish_one_off(pq, task_id, started_at, name, TaskStatus.FAILED, str(e))
         return None
 
     return _ChildSlot(
@@ -1146,6 +1198,7 @@ def _claim_and_fork_one_off(
         name=name,
         start_time=time.perf_counter(),
         is_periodic=False,
+        started_at=started_at,
     )
 
 
@@ -1342,29 +1395,14 @@ def _reap_and_update(pq: PQ, slot: _ChildSlot) -> None:
         if result.exit_kind == "timeout":
             error_msg = f"Timed out after {elapsed:.3f} s"
 
-        try:
-            with pq.session() as session:
-                values: dict[str, object] = {
-                    "status": result.task_status,
-                    "completed_at": datetime.now(UTC),
-                }
-                if error_msg:
-                    values["error"] = error_msg
-                row_result = session.execute(
-                    update(Task)
-                    .where(
-                        Task.id == slot.task_id,
-                        Task.status == TaskStatus.RUNNING,
-                    )
-                    .values(**values)
-                )
-                if row_result.rowcount == 0:
-                    logger.warning(
-                        f"Task '{slot.name}' (id={slot.task_id}) was no longer"
-                        " RUNNING when reap tried to update — likely reaped"
-                    )
-        except Exception as e:
-            logger.error(f"Error updating task status: {e}")
+        _finish_one_off(
+            pq,
+            slot.task_id,
+            slot.started_at,
+            slot.name,
+            result.task_status,
+            error_msg,
+        )
 
         if result.task_status == TaskStatus.COMPLETED:
             logger.debug(f"Task '{slot.name}' completed in {elapsed:.3f} s")
