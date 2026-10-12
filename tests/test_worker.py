@@ -1798,6 +1798,41 @@ class TestGracefulShutdown(_ForkedWorkers):
         assert "shutdown" in (task.error or "")
         self._assert_no_running(pq)
 
+    def test_sigterm_while_forking_does_not_hang(self) -> None:
+        """SIGTERM handled during fork() must not hang the worker: loguru
+        keeps its handler locks acquired across fork(), and the drain handler
+        logs. Without the signal mask in _fork_child about half of these
+        workers hang."""
+        import os
+        import random
+        import signal as sig
+
+        from pq.models import Task
+        from pq.worker import _fork_child, _handle_shutdown_signal, _shutdown
+
+        for _ in range(20):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    _shutdown.reset(drain_timeout=1)
+                    sig.signal(sig.SIGTERM, _handle_shutdown_signal)
+                    while not _shutdown.requested:
+                        child_pid, read_fd = _fork_child(
+                            noop_handler,
+                            (),
+                            {},
+                            max_runtime=5,
+                            task=Task(name="noop", payload={}),
+                        )
+                        os.waitpid(child_pid, 0)
+                        os.close(read_fd)
+                finally:
+                    os._exit(0)
+            self._worker_pids.append(pid)
+            time.sleep(random.uniform(0.05, 0.15))
+            os.kill(pid, sig.SIGTERM)
+            self._wait_for_exit(pid, timeout=5)
+
     def test_periodic_in_flight_lock_cleared(self, pq: PQ, db_url: str) -> None:
         """Periodic task killed by the drain: locked_until cleared, schedule
         intact, no one-off rows involved."""

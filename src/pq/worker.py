@@ -338,7 +338,17 @@ def _fork_child(
         Tuple of (child_pid, read_fd) for monitoring the child.
     """
     read_fd, write_fd = os.pipe()
-    child_pid = os.fork()
+    # Hold SIGTERM/SIGINT across fork(). loguru keeps its handler locks
+    # acquired during fork(), so the shutdown handler's log call would
+    # deadlock if the signal were handled then. A blocked signal is delivered
+    # once the mask is restored.
+    previous_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+    )
+    try:
+        child_pid = os.fork()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     if child_pid == 0:
         # === CHILD PROCESS ===
