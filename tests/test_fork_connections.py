@@ -13,17 +13,20 @@ plain socket the damage needs overlap: the parent's query queues behind the
 child's, and whichever process reads first gets the other's result.
 """
 
+import gc
 import multiprocessing
 import multiprocessing.managers
 import os
+import sys
 import time
+import weakref
 from typing import Any
 
 import pytest
 from loguru import logger
 from sqlalchemy import text
 
-from pq.client import PQ
+from pq.client import PQ, _live_instances
 
 _shared_results: Any = None
 _app_pq: PQ | None = None
@@ -200,3 +203,43 @@ class TestTaskChildConnectionsOverTls:
 
         assert list(errors) == []
         assert tls_pq.pending_count() == 0
+
+
+class TestForkHookInstanceTracking:
+    def test_collected_instance_does_not_break_the_fork_hook(
+        self, pq: PQ, db_url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A PQ instance garbage-collected before a fork drops out of the
+        hook's WeakSet; the hook still resets the instances that remain."""
+        collected = PQ(db_url)
+        collected_ref = weakref.ref(collected)
+        del collected
+        gc.collect()
+        assert collected_ref() is None
+        assert pq in _live_instances
+
+        # Exceptions raised by fork hooks are reported through
+        # sys.unraisablehook, which the child inherits.
+        hook_errors: list[str] = []
+        monkeypatch.setattr(
+            sys, "unraisablehook", lambda u: hook_errors.append(repr(u.exc_value))
+        )
+        parent_backend = _backend_pid(pq)
+        result_read, result_write = os.pipe()
+        child = os.fork()
+        if child == 0:
+            status = 1
+            try:
+                if not hook_errors and _backend_pid(pq) != parent_backend:
+                    status = 0
+            finally:
+                os.write(result_write, b"\n".join(e.encode() for e in hook_errors))
+                os._exit(status)
+        os.close(result_write)
+        with os.fdopen(result_read, "rb") as reader:
+            child_errors = reader.read().decode()
+        _, wait_status = os.waitpid(child, 0)
+
+        assert child_errors == ""
+        assert os.waitstatus_to_exitcode(wait_status) == 0
+        assert _backend_pid(pq) == parent_backend
