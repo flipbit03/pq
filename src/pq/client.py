@@ -65,8 +65,9 @@ def _validate_max_runtime(max_runtime_seconds: float | None) -> None:
 
 
 _live_instances: "weakref.WeakSet[PQ]" = weakref.WeakSet()
-"""Every open ``PQ`` instance, so a forked child can reset their pools. Weak
-references: the set never keeps an instance alive."""
+"""Every ``PQ`` instance, so a forked child can reset their pools. Weak
+references: the set never keeps an instance alive. ``close()`` does not remove
+an instance: its engine reconnects if it is used again."""
 
 
 def _reset_pools_after_fork() -> None:
@@ -80,9 +81,18 @@ def _reset_pools_after_fork() -> None:
     ``close=False`` drops the inherited pool without closing its connections.
     Closing them would send a terminate message on the parent's sockets and
     break the parent's sessions.
+
+    Connections checked out at fork time are not covered: if the child returns
+    one (for example by leaving a ``with pq.session()`` block it was forked
+    in), the commit and rollback still go out on the parent's socket.
     """
     for instance in list(_live_instances):
-        instance._engine.dispose(close=False)
+        try:
+            instance._engine.dispose(close=False)
+        except Exception:
+            # One failing instance must not leave the others on their
+            # inherited pools.
+            logger.exception("Failed to reset a PQ connection pool after fork")
 
 
 if hasattr(os, "register_at_fork"):
@@ -127,7 +137,6 @@ class PQ:
         This closes all connections in the connection pool. After calling
         this method, the PQ instance should not be used.
         """
-        _live_instances.discard(self)
         self._engine.dispose()
 
     def __enter__(self) -> Self:

@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 from loguru import logger
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from pq.client import PQ, _live_instances
 
@@ -47,6 +47,26 @@ def _set_app_pq(pq: PQ) -> None:
 def _backend_pid(pq: PQ) -> int:
     with pq.session() as session:
         return session.execute(text("SELECT pg_backend_pid()")).scalar_one()
+
+
+def _backend_pids_in_fork(*instances: PQ) -> list[int]:
+    """Fork; the child reports the backend pid each instance gives it."""
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        status = 1
+        try:
+            pids = " ".join(str(_backend_pid(instance)) for instance in instances)
+            os.write(write_fd, pids.encode())
+            status = 0
+        finally:
+            os._exit(status)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as reader:
+        output = reader.read().decode()
+    _, wait_status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(wait_status) == 0, "the child failed to query"
+    return [int(pid) for pid in output.split()]
 
 
 def backend_pid_handler() -> None:
@@ -243,3 +263,41 @@ class TestForkHookInstanceTracking:
         assert child_errors == ""
         assert os.waitstatus_to_exitcode(wait_status) == 0
         assert _backend_pid(pq) == parent_backend
+
+    def test_closed_instance_is_still_reset_after_fork(self, db_url: str) -> None:
+        """close() disposes the pool, but the engine reconnects if the
+        instance is used again, so the hook must still cover it."""
+        pq = PQ(db_url)
+        try:
+            pq.close()
+            parent_backend = _backend_pid(pq)
+
+            assert _backend_pids_in_fork(pq) != [parent_backend]
+        finally:
+            pq.close()
+
+    def test_failing_instance_does_not_stop_the_fork_hook(self, db_url: str) -> None:
+        """An error while resetting one instance must not leave the other
+        instances on their inherited pools."""
+        instances = [PQ(db_url), PQ(db_url)]
+
+        def fail(_: object) -> None:
+            raise RuntimeError("engine_disposed listener failed")
+
+        try:
+            # engine_disposed fires after the pool is replaced, so every
+            # instance is reset if the hook reaches it, despite the error.
+            for instance in instances:
+                event.listen(instance._engine, "engine_disposed", fail)
+            parent_backends = [_backend_pid(instance) for instance in instances]
+
+            child_backends = _backend_pids_in_fork(*instances)
+
+            for parent_backend, child_backend in zip(
+                parent_backends, child_backends, strict=True
+            ):
+                assert child_backend != parent_backend
+        finally:
+            for instance in instances:
+                event.remove(instance._engine, "engine_disposed", fail)
+                instance.close()
