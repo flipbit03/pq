@@ -10,17 +10,34 @@ import pytest
 from pq.client import PQ
 
 
-@pytest.fixture
-def db_url() -> str:
-    """Database URL for tests."""
-    url = os.environ.get(
-        "PQ_DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/postgres"
-    )
+def _without_gssapi(url: str) -> str:
     # Disable GSSAPI to prevent segfaults when forking (psycopg2-binary bundles
     # libkrb5/libgssapi whose internal state corrupts across os.fork).
     if "gssencmode" not in url:
         url += "&gssencmode=disable" if "?" in url else "?gssencmode=disable"
     return url
+
+
+@pytest.fixture
+def db_url() -> str:
+    """Database URL for tests."""
+    return _without_gssapi(
+        os.environ.get(
+            "PQ_DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/postgres"
+        )
+    )
+
+
+@pytest.fixture
+def tls_db_url() -> str:
+    """URL of the Postgres that only speaks TLS (``postgres-tls`` in
+    docker-compose.yml), for tests whose failure only shows over TLS."""
+    return _without_gssapi(
+        os.environ.get(
+            "PQ_TLS_DATABASE_URL",
+            "postgresql://postgres:postgres@localhost:5434/postgres?sslmode=require",
+        )
+    )
 
 
 @pytest.fixture

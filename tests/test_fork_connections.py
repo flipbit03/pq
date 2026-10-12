@@ -156,14 +156,15 @@ def _child_queries_while_parent_holds_session(pq: PQ) -> None:
         os.waitpid(child, 0)
 
 
-@pytest.mark.skipif(
-    "PQ_TLS_DATABASE_URL" not in os.environ,
-    reason="needs a Postgres reachable over TLS (PQ_TLS_DATABASE_URL)",
-)
 class TestTaskChildConnectionsOverTls:
     @pytest.fixture
-    def tls_pq(self) -> Any:
-        pq = PQ(os.environ["PQ_TLS_DATABASE_URL"])
+    def tls_pq(self, tls_db_url: str) -> Any:
+        pq = PQ(tls_db_url)
+        with pq.session() as session:
+            uses_tls = session.execute(
+                text("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+            ).scalar_one()
+        assert uses_tls, f"{tls_db_url} is not a TLS connection"
         pq.create_tables()
         pq.clear_all()
         yield pq
@@ -175,7 +176,10 @@ class TestTaskChildConnectionsOverTls:
         _child_queries_while_parent_holds_session(tls_pq)
 
     def test_worker_loop_claims_cleanly_over_tls(
-        self, tls_pq: PQ, manager: multiprocessing.managers.SyncManager
+        self,
+        tls_pq: PQ,
+        tls_db_url: str,
+        manager: multiprocessing.managers.SyncManager,
     ) -> None:
         errors = manager.list()
         started = manager.list()
@@ -185,7 +189,7 @@ class TestTaskChildConnectionsOverTls:
 
         worker = multiprocessing.get_context("fork").Process(
             target=_run_worker_capturing_errors,
-            args=(os.environ["PQ_TLS_DATABASE_URL"], errors, started, 6.0),
+            args=(tls_db_url, errors, started, 6.0),
         )
         worker.start()
         worker.join(timeout=30)

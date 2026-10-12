@@ -61,7 +61,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # A service container cannot be given a start command, and TLS needs
+      # `-c ssl=on`, so the TLS Postgres comes from docker-compose.yml.
+      - name: Start TLS Postgres
+        run: docker compose up -d --wait postgres-tls
+
       - name: Run tests
         env:
           PQ_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          PQ_TLS_DATABASE_URL: postgresql://postgres:postgres@localhost:5434/postgres?sslmode=require
         run: uv run pytest

@@ -16,5 +16,33 @@ services:
       timeout: 0.5s
       retries: 50
 
+  # Speaks TLS only, with the test-only certificate in tests/tls. Some fork
+  # bugs only show over TLS: a child that writes on an inherited connection
+  # desynchronises the parent's record sequence numbers.
+  postgres-tls:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./tests/tls:/certs-src:ro
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        mkdir -p /certs && cp /certs-src/server.crt /certs-src/server.key /certs/ &&
+        chown postgres /certs/server.crt /certs/server.key && chmod 600 /certs/server.key &&
+        exec docker-entrypoint.sh postgres -c ssl=on
+        -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 0.1s
+      timeout: 0.5s
+      retries: 50
+
 volumes:
   postgres_data:
