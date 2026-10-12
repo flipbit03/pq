@@ -11,14 +11,15 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
       interval: 0.1s
       timeout: 0.5s
       retries: 50
 
-  # Speaks TLS only, with the test-only certificate in tests/tls. Some fork
-  # bugs only show over TLS: a child that writes on an inherited connection
-  # desynchronises the parent's record sequence numbers.
+  # Speaks TLS only (tests/tls/pg_hba.conf rejects plain TCP), with the
+  # test-only certificate in tests/tls. Some fork bugs only show over TLS: a
+  # child that writes on an inherited connection desynchronises the parent's
+  # record sequence numbers.
   postgres-tls:
     image: postgres:18-alpine
     environment:
@@ -34,12 +35,14 @@ services:
       - sh
       - -c
       - >-
-        mkdir -p /certs && cp /certs-src/server.crt /certs-src/server.key /certs/ &&
-        chown postgres /certs/server.crt /certs/server.key && chmod 600 /certs/server.key &&
+        mkdir -p /certs &&
+        cp /certs-src/server.crt /certs-src/server.key /certs-src/pg_hba.conf /certs/ &&
+        chown postgres /certs/* && chmod 600 /certs/server.key &&
         exec docker-entrypoint.sh postgres -c ssl=on
         -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
+        -c hba_file=/certs/pg_hba.conf
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
       interval: 0.1s
       timeout: 0.5s
       retries: 50
