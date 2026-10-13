@@ -4,10 +4,16 @@ import multiprocessing
 import multiprocessing.managers
 import os
 from collections.abc import Generator
+from typing import TYPE_CHECKING
 
 import pytest
+from loguru import logger
+from sqlalchemy import text
 
 from pq.client import PQ
+
+if TYPE_CHECKING:
+    from loguru import Record
 
 
 def _without_gssapi(url: str) -> str:
@@ -40,15 +46,40 @@ def tls_db_url() -> str:
     )
 
 
-@pytest.fixture
-def pq(db_url: str) -> Generator[PQ, None, None]:
-    """PQ client with clean database for each test."""
-    client = PQ(db_url)
+def _clean_pq(url: str) -> Generator[PQ, None, None]:
+    client = PQ(url)
     client.create_tables()
     client.clear_all()
     yield client
     client.clear_all()
     client.close()
+
+
+@pytest.fixture
+def pq(db_url: str) -> Generator[PQ, None, None]:
+    """PQ client with clean database for each test."""
+    yield from _clean_pq(db_url)
+
+
+@pytest.fixture
+def tls_pq(tls_db_url: str) -> Generator[PQ, None, None]:
+    """Like ``pq``, on the TLS-only Postgres. Fails if the session isn't TLS."""
+    for client in _clean_pq(tls_db_url):
+        with client.session() as session:
+            uses_tls = session.execute(
+                text("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+            ).scalar_one()
+        assert uses_tls, f"{tls_db_url} is not a TLS connection"
+        yield client
+
+
+@pytest.fixture
+def log_records() -> Generator[list["Record"], None, None]:
+    """Every loguru record emitted during the test, DEBUG and up."""
+    records: list[Record] = []
+    sink = logger.add(lambda message: records.append(message.record), level="DEBUG")
+    yield records
+    logger.remove(sink)
 
 
 @pytest.fixture

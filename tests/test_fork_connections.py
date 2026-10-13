@@ -17,11 +17,12 @@ import gc
 import multiprocessing
 import multiprocessing.managers
 import os
-import signal
 import sys
+import time
 import weakref
 from collections.abc import Generator
 from multiprocessing.managers import ListProxy
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import pytest
@@ -30,6 +31,10 @@ from sqlalchemy import event, text
 
 from pq import client
 from pq.client import PQ, _live_instances
+from pq.models import TaskStatus
+
+if TYPE_CHECKING:
+    from loguru import Record
 
 _shared_results: ListProxy[int] | None = None
 _app_pq: PQ | None = None
@@ -53,22 +58,35 @@ def _backend_pid(pq: PQ) -> int:
 
 
 def _backend_pids_in_fork(*instances: PQ) -> list[int]:
-    """Fork; the child reports the backend pid each instance gives it."""
+    """Fork; the child reports the backend pid each instance gives it.
+
+    The child fails instead if a fork hook raised: CPython reports those
+    through ``sys.unraisablehook``.
+    """
+    hook_errors: list[str] = []
     read_fd, write_fd = os.pipe()
-    child = os.fork()
+    previous_hook = sys.unraisablehook
+    sys.unraisablehook = lambda u: hook_errors.append(repr(u.exc_value))
+    try:
+        child = os.fork()
+    finally:
+        sys.unraisablehook = previous_hook
     if child == 0:
         status = 1
         try:
-            pids = " ".join(str(_backend_pid(instance)) for instance in instances)
-            os.write(write_fd, pids.encode())
-            status = 0
+            if hook_errors:
+                os.write(write_fd, "\n".join(hook_errors).encode())
+            else:
+                pids = " ".join(str(_backend_pid(i)) for i in instances)
+                os.write(write_fd, pids.encode())
+                status = 0
         finally:
             os._exit(status)
     os.close(write_fd)
     with os.fdopen(read_fd, "rb") as reader:
         output = reader.read().decode()
     _, wait_status = os.waitpid(child, 0)
-    assert os.waitstatus_to_exitcode(wait_status) == 0, "the child failed to query"
+    assert os.waitstatus_to_exitcode(wait_status) == 0, f"the child failed: {output}"
     return [int(pid) for pid in output.split()]
 
 
@@ -89,10 +107,8 @@ def noop_handler() -> None:
     pass
 
 
-def _run_worker_capturing_errors(
-    db_url: str, errors: ListProxy[str], seconds: float
-) -> None:
-    """Worker process: run the real loop for ``seconds``, recording ERROR logs."""
+def _run_worker_capturing_errors(db_url: str, errors: ListProxy[str]) -> None:
+    """Worker process: run the real loop until SIGTERM, recording ERROR logs."""
     from pq.worker import run_worker
 
     pq = PQ(db_url)
@@ -101,11 +117,42 @@ def _run_worker_capturing_errors(
         lambda message: errors.append(message.record["message"]),
         level="ERROR",
     )
-
-    # Stop the loop from a signal once the window is over.
-    signal.signal(signal.SIGALRM, lambda *_: os.kill(os.getpid(), signal.SIGTERM))
-    signal.setitimer(signal.ITIMER_REAL, seconds)
     run_worker(pq, concurrency=2, poll_interval=0.02, drain_timeout=5)
+
+
+def _assert_worker_loop_runs_clean(
+    pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+) -> None:
+    """Run the real worker loop while one task child holds a query open
+    through the application's PQ instance and the other slot claims and
+    reaps around it. The loop must log no errors and finish every task."""
+    errors = manager.list()
+    hold_id = pq.enqueue(hold_connection_handler, seconds=2.0)
+    for _ in range(5):
+        pq.enqueue(noop_handler)
+
+    worker = multiprocessing.get_context("fork").Process(
+        target=_run_worker_capturing_errors, args=(db_url, errors)
+    )
+    worker.start()
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        hold = pq.get_task(hold_id)
+        if hold is not None and hold.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+        ):
+            break
+        time.sleep(0.05)
+    worker.terminate()  # SIGTERM: the worker drains and returns
+    worker.join(timeout=10)
+    if worker.is_alive():
+        worker.kill()
+        worker.join()
+        pytest.fail(f"worker hung; errors logged: {list(errors)}")
+
+    assert list(errors) == []
+    assert pq.pending_count() == 0
 
 
 class TestTaskChildConnections:
@@ -132,70 +179,37 @@ class TestTaskChildConnections:
     ) -> None:
         """The real worker loop must claim cleanly while a child holds a query
         open through the application's PQ instance."""
-        errors = manager.list()
-        pq.enqueue(hold_connection_handler, seconds=2.0)
-        for _ in range(5):
-            pq.enqueue(noop_handler)
-
-        worker = multiprocessing.get_context("fork").Process(
-            target=_run_worker_capturing_errors,
-            args=(db_url, errors, 6.0),
-        )
-        worker.start()
-        worker.join(timeout=30)
-        if worker.is_alive():
-            worker.kill()
-            worker.join()
-            pytest.fail(f"worker hung; errors logged: {list(errors)}")
-
-        assert list(errors) == []
-        assert pq.pending_count() == 0
-
-
-def _child_queries_while_parent_holds_session(pq: PQ) -> None:
-    """Fork, let the parent check a connection out (its pre-ping passes), let
-    the child query through its inherited pool, then query on the parent's
-    still-open session. This is the order the worker loop produces: a child
-    forked earlier enqueues while the parent claims or reaps."""
-    _backend_pid(pq)  # one idle pooled connection, inherited by the child
-    go_read, go_write = os.pipe()
-    done_read, done_write = os.pipe()
-    child = os.fork()
-    if child == 0:
-        os.read(go_read, 1)
-        try:
-            _backend_pid(pq)
-        finally:
-            os.write(done_write, b"x")
-            os._exit(0)
-    try:
-        with pq.session() as session:
-            session.execute(text("SELECT 1"))
-            os.write(go_write, b"x")
-            os.read(done_read, 1)
-            session.execute(text("SELECT 1"))
-    finally:
-        os.waitpid(child, 0)
+        _assert_worker_loop_runs_clean(pq, db_url, manager)
 
 
 class TestTaskChildConnectionsOverTls:
-    @pytest.fixture
-    def tls_pq(self, tls_db_url: str) -> Generator[PQ, None, None]:
-        pq = PQ(tls_db_url)
-        with pq.session() as session:
-            uses_tls = session.execute(
-                text("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
-            ).scalar_one()
-        assert uses_tls, f"{tls_db_url} is not a TLS connection"
-        pq.create_tables()
-        pq.clear_all()
-        yield pq
-        pq.clear_all()
-        pq.close()
-
     def test_parent_session_survives_a_child_query(self, tls_pq: PQ) -> None:
-        """One query from the child must not break the parent's open session."""
-        _child_queries_while_parent_holds_session(tls_pq)
+        """One query from the child must not break the parent's open session.
+
+        Fork, let the parent check a connection out (its pre-ping passes), let
+        the child query through its inherited pool, then query on the parent's
+        still-open session. This is the order the worker loop produces: a
+        child forked earlier enqueues while the parent claims or reaps.
+        """
+        _backend_pid(tls_pq)  # one idle pooled connection, inherited by the child
+        go_read, go_write = os.pipe()
+        done_read, done_write = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.read(go_read, 1)
+            try:
+                _backend_pid(tls_pq)
+            finally:
+                os.write(done_write, b"x")
+                os._exit(0)
+        try:
+            with tls_pq.session() as session:
+                session.execute(text("SELECT 1"))
+                os.write(go_write, b"x")
+                os.read(done_read, 1)
+                session.execute(text("SELECT 1"))
+        finally:
+            os.waitpid(child, 0)
 
     def test_worker_loop_claims_cleanly_over_tls(
         self,
@@ -203,63 +217,26 @@ class TestTaskChildConnectionsOverTls:
         tls_db_url: str,
         manager: multiprocessing.managers.SyncManager,
     ) -> None:
-        errors = manager.list()
-        tls_pq.enqueue(hold_connection_handler, seconds=2.0)
-        for _ in range(5):
-            tls_pq.enqueue(noop_handler)
-
-        worker = multiprocessing.get_context("fork").Process(
-            target=_run_worker_capturing_errors,
-            args=(tls_db_url, errors, 6.0),
-        )
-        worker.start()
-        worker.join(timeout=30)
-        if worker.is_alive():
-            worker.kill()
-            worker.join()
-            pytest.fail(f"worker hung; errors logged: {list(errors)}")
-
-        assert list(errors) == []
-        assert tls_pq.pending_count() == 0
+        """Over TLS one child query is enough to break the parent's session."""
+        _assert_worker_loop_runs_clean(tls_pq, tls_db_url, manager)
 
 
 class TestForkHookInstanceTracking:
     def test_collected_instance_does_not_break_the_fork_hook(
-        self, pq: PQ, db_url: str, monkeypatch: pytest.MonkeyPatch
+        self, pq: PQ, db_url: str
     ) -> None:
         """A PQ instance garbage-collected before a fork drops out of the
-        hook's WeakSet; the hook still resets the instances that remain."""
+        hook's WeakSet; the hook raises nothing and still resets the
+        instances that remain."""
         collected = PQ(db_url)
         collected_ref = weakref.ref(collected)
         del collected
         gc.collect()
         assert collected_ref() is None
         assert pq in _live_instances
-
-        # Exceptions raised by fork hooks are reported through
-        # sys.unraisablehook, which the child inherits.
-        hook_errors: list[str] = []
-        monkeypatch.setattr(
-            sys, "unraisablehook", lambda u: hook_errors.append(repr(u.exc_value))
-        )
         parent_backend = _backend_pid(pq)
-        result_read, result_write = os.pipe()
-        child = os.fork()
-        if child == 0:
-            status = 1
-            try:
-                if not hook_errors and _backend_pid(pq) != parent_backend:
-                    status = 0
-            finally:
-                os.write(result_write, b"\n".join(e.encode() for e in hook_errors))
-                os._exit(status)
-        os.close(result_write)
-        with os.fdopen(result_read, "rb") as reader:
-            child_errors = reader.read().decode()
-        _, wait_status = os.waitpid(child, 0)
 
-        assert child_errors == ""
-        assert os.waitstatus_to_exitcode(wait_status) == 0
+        assert _backend_pids_in_fork(pq) != [parent_backend]
         assert _backend_pid(pq) == parent_backend
 
     def test_closed_instance_is_still_reset_after_fork(self, db_url: str) -> None:
@@ -326,25 +303,19 @@ class TestResetPoolsAfterFork:
             engine.dispose.assert_called_once_with(close=False)
 
     def test_logs_a_failure_and_resets_the_other_instances(
-        self, engines: list[Mock]
+        self, engines: list[Mock], log_records: list["Record"]
     ) -> None:
         for engine in engines:
             engine.dispose.side_effect = RuntimeError("listener failed")
-        errors: list[str] = []
-        sink = logger.add(
-            lambda message: errors.append(
-                f"{message.record['message']}: {message.record['exception']}"
-            ),
-            level="ERROR",
-        )
-        try:
-            client._reset_pools_after_fork()
-        finally:
-            logger.remove(sink)
+
+        client._reset_pools_after_fork()
 
         for engine in engines:
             engine.dispose.assert_called_once_with(close=False)
-        assert len(errors) == 2
-        for error in errors:
-            assert error.startswith("Failed to reset a PQ connection pool after fork")
-            assert "listener failed" in error
+        assert [r["message"] for r in log_records] == [
+            "Failed to reset a PQ connection pool after fork"
+        ] * 2
+        for record in log_records:
+            assert record["level"].name == "ERROR"
+            assert record["exception"] is not None
+            assert str(record["exception"].value) == "listener failed"
