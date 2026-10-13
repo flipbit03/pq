@@ -84,7 +84,8 @@ def _reset_pools_after_fork() -> None:
 
     Connections checked out at fork time are not covered: if the child returns
     one (for example by leaving a ``with pq.session()`` block it was forked
-    in), the commit and rollback still go out on the parent's socket.
+    in), the commit and rollback still go out on the parent's socket. Do not
+    fork inside an open ``pq.session()``.
     """
     for instance in list(_live_instances):
         try:
