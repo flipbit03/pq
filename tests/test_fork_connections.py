@@ -1,4 +1,5 @@
-"""A task child must not use the parent worker's database connections.
+"""A task child must not use the parent worker's database connections, and
+must close its own before it exits.
 
 The worker forks a child per task, and the child inherits the parent's
 SQLAlchemy engine: its pool holds the sockets the parent claims on. A handler
@@ -11,8 +12,13 @@ sequence numbers in the child's copy of the SSL state only, and the parent's
 next record is rejected (``bad record mac`` / ``decryption failed``). Over a
 plain socket the damage needs overlap: the parent's query queues behind the
 child's, and whichever process reads first gets the other's result.
+
+A child that opens connections of its own ends with ``os._exit()``, which skips
+interpreter cleanup: unless pq closes them first, Postgres sees each one drop
+without a terminate message.
 """
 
+import asyncio
 import gc
 import multiprocessing
 import multiprocessing.managers
@@ -20,18 +26,20 @@ import os
 import sys
 import time
 import weakref
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from multiprocessing.managers import ListProxy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 from unittest.mock import Mock
 
 import pytest
 from loguru import logger
 from sqlalchemy import event, text
+from sqlalchemy.engine import make_url
 
 from pq import client
 from pq.client import PQ, _live_instances
-from pq.models import TaskStatus
+from pq.models import Task, TaskStatus
+from pq.worker import EXIT_FAILURE, EXIT_SUCCESS, EXIT_TIMEOUT
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -105,6 +113,22 @@ def hold_connection_handler(seconds: float) -> None:
 
 def noop_handler() -> None:
     pass
+
+
+def query_handler(fail: bool) -> None:
+    """Query through the application's PQ instance, then succeed or fail."""
+    assert _app_pq is not None
+    _backend_pid(_app_pq)
+    if fail:
+        raise RuntimeError("task failed after its query")
+
+
+def failing_handler() -> None:
+    raise RuntimeError("task failed")
+
+
+async def slow_async_handler() -> None:
+    await asyncio.sleep(5)
 
 
 def _run_worker_capturing_errors(db_url: str, errors: ListProxy[str]) -> None:
@@ -278,43 +302,191 @@ class TestForkHookInstanceTracking:
                 instance.close()
 
 
-class TestResetPoolsAfterFork:
-    """The fork hook on its own, with mocked engines: no fork, no database."""
+PROBE_DATABASE = "pq_child_exit_probe"
 
-    @pytest.fixture
-    def engines(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> Generator[list[Mock], None, None]:
-        """Two tracked PQ instances whose engines are mocks."""
-        monkeypatch.setattr(client, "_live_instances", weakref.WeakSet())
-        engines = [Mock(), Mock()]
-        # Held until teardown: the hook's set only references them weakly.
-        instances = [PQ("postgresql://localhost/unused") for _ in engines]
-        for instance, engine in zip(instances, engines, strict=True):
-            monkeypatch.setattr(instance, "_engine", engine)
-        yield engines
 
-    def test_drops_every_pool_without_closing_its_connections(
-        self, engines: list[Mock]
+def _session_end_stats(pq: PQ) -> tuple[int, float]:
+    """``(sessions_abandoned, session_time)`` of the probe database. Postgres
+    adds to both when a session ends; abandoned means the client went away
+    without a terminate message."""
+    with pq.session() as session:
+        row = session.execute(
+            text(
+                "SELECT sessions_abandoned, session_time FROM pg_stat_database"
+                " WHERE datname = :name"
+            ),
+            {"name": PROBE_DATABASE},
+        ).one_or_none()
+    return (0, 0.0) if row is None else (row[0], row[1])
+
+
+def _recreate_probe_database(pq: PQ, *, create: bool) -> None:
+    with pq._engine.connect().execution_options(
+        isolation_level="AUTOCOMMIT"
+    ) as connection:
+        connection.execute(text(f"DROP DATABASE IF EXISTS {PROBE_DATABASE} (FORCE)"))
+        if create:
+            connection.execute(text(f"CREATE DATABASE {PROBE_DATABASE}"))
+
+
+class TestTaskChildClosesItsConnections:
+    @pytest.fixture(params=["plain", "tls"])
+    def pq_and_probe(
+        self, request: pytest.FixtureRequest
+    ) -> Generator[tuple[PQ, PQ], None, None]:
+        """The test's PQ, and a PQ on a fresh database of its own on the same
+        server. Only the task child connects to the probe database, so its
+        session counters count the child's sessions and nothing else."""
+        tls = request.param == "tls"
+        pq: PQ = request.getfixturevalue("tls_pq" if tls else "pq")
+        url = make_url(request.getfixturevalue("tls_db_url" if tls else "db_url"))
+        _recreate_probe_database(pq, create=True)
+        probe = PQ(url.set(database=PROBE_DATABASE).render_as_string(False))
+        yield pq, probe
+        probe.close()
+        _recreate_probe_database(pq, create=False)
+
+    @pytest.mark.parametrize("fail", [False, True], ids=["completed", "failed"])
+    def test_task_child_hangs_up_before_it_exits(
+        self, pq_and_probe: tuple[PQ, PQ], fail: bool
     ) -> None:
-        client._reset_pools_after_fork()
+        """A task that queried through pq must close that connection before
+        its child exits. Otherwise Postgres counts the session as abandoned,
+        and over TLS logs ``unexpected eof while reading``."""
+        pq, probe = pq_and_probe
+        _set_app_pq(probe)
+        task_id = pq.enqueue(query_handler, fail=fail)
+
+        assert pq.run_worker_once() is True
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == (TaskStatus.FAILED if fail else TaskStatus.COMPLETED)
+
+        deadline = time.monotonic() + 5
+        abandoned, session_time = _session_end_stats(pq)
+        while session_time == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+            abandoned, session_time = _session_end_stats(pq)
+        assert session_time > 0, "the task child's session never ended"
+        assert abandoned == 0, "the task child exited without closing its connection"
+
+
+class _Exited(Exception):
+    """Raised by the stubbed ``os._exit()``."""
+
+
+class TestRunInChildClosesPools:
+    """``_run_in_child`` with its process-level calls stubbed out: on every
+    exit path it closes pq's pools, then exits."""
+
+    @pytest.mark.parametrize(
+        ("handler", "max_runtime", "exit_code"),
+        [
+            (noop_handler, 5.0, EXIT_SUCCESS),
+            (failing_handler, 5.0, EXIT_FAILURE),
+            (slow_async_handler, 0.01, EXIT_TIMEOUT),
+        ],
+        ids=["success", "failure", "async_timeout"],
+    )
+    def test_closes_pools_then_exits(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        handler: Callable[[], object],
+        max_runtime: float,
+        exit_code: int,
+    ) -> None:
+        from pq import worker
+
+        calls: list[str] = []
+
+        def fake_exit(code: int) -> NoReturn:
+            calls.append(f"exit {code}")
+            raise _Exited
+
+        monkeypatch.setattr(os, "setpgrp", lambda: None)
+        monkeypatch.setattr(os, "_exit", fake_exit)
+        monkeypatch.setattr(worker.signal, "signal", lambda *_: None)
+        monkeypatch.setattr(worker.signal, "alarm", lambda _: 0)
+        monkeypatch.setattr(
+            worker, "_close_pools_before_exit", lambda: calls.append("close")
+        )
+        read_fd, write_fd = os.pipe()
+        try:
+            with pytest.raises(_Exited):
+                worker._run_in_child(
+                    handler,
+                    (),
+                    {},
+                    max_runtime,
+                    write_fd,
+                    Task(name="t", payload={}),
+                    None,
+                    None,
+                )
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+        assert calls == ["close", f"exit {exit_code}"]
+
+
+@pytest.fixture
+def engines(monkeypatch: pytest.MonkeyPatch) -> Generator[list[Mock], None, None]:
+    """Two tracked PQ instances whose engines are mocks."""
+    monkeypatch.setattr(client, "_live_instances", weakref.WeakSet())
+    engines = [Mock(), Mock()]
+    # Held until teardown: the hooks' set only references them weakly.
+    instances = [PQ("postgresql://localhost/unused") for _ in engines]
+    for instance, engine in zip(instances, engines, strict=True):
+        monkeypatch.setattr(instance, "_engine", engine)
+    yield engines
+
+
+@pytest.mark.parametrize(
+    ("dispose_pools", "close", "failure"),
+    [
+        (
+            client._reset_pools_after_fork,
+            False,
+            "Failed to reset a PQ connection pool after fork",
+        ),
+        (client._close_pools_before_exit, True, "Failed to close a PQ connection pool"),
+    ],
+    ids=["reset_after_fork", "close_before_exit"],
+)
+class TestPoolHooks:
+    """The fork and exit hooks on their own, with mocked engines: no fork, no
+    database. The fork hook drops pools without closing them; the exit hook
+    closes them."""
+
+    def test_disposes_every_pool(
+        self,
+        engines: list[Mock],
+        dispose_pools: Callable[[], None],
+        close: bool,
+        failure: str,
+    ) -> None:
+        dispose_pools()
 
         for engine in engines:
-            engine.dispose.assert_called_once_with(close=False)
+            engine.dispose.assert_called_once_with(close=close)
 
-    def test_logs_a_failure_and_resets_the_other_instances(
-        self, engines: list[Mock], log_records: list["Record"]
+    def test_logs_a_failure_and_disposes_the_other_instances(
+        self,
+        engines: list[Mock],
+        log_records: list["Record"],
+        dispose_pools: Callable[[], None],
+        close: bool,
+        failure: str,
     ) -> None:
         for engine in engines:
             engine.dispose.side_effect = RuntimeError("listener failed")
 
-        client._reset_pools_after_fork()
+        dispose_pools()
 
         for engine in engines:
-            engine.dispose.assert_called_once_with(close=False)
-        assert [r["message"] for r in log_records] == [
-            "Failed to reset a PQ connection pool after fork"
-        ] * 2
+            engine.dispose.assert_called_once_with(close=close)
+        assert [r["message"] for r in log_records] == [failure] * 2
         for record in log_records:
             assert record["level"].name == "ERROR"
             assert record["exception"] is not None

@@ -87,13 +87,32 @@ def _reset_pools_after_fork() -> None:
     in), the commit and rollback still go out on the parent's socket. Do not
     fork inside an open ``pq.session()``.
     """
+    _dispose_pools(
+        close=False, failure="Failed to reset a PQ connection pool after fork"
+    )
+
+
+def _close_pools_before_exit() -> None:
+    """Close the connections a forked child opened, before it calls
+    ``os._exit()``.
+
+    ``os._exit()`` skips interpreter cleanup, so without this Postgres sees
+    each connection drop without a terminate message: it counts the session
+    as abandoned, and over TLS logs ``unexpected eof while reading``. The
+    connections inherited from the parent are not in these pools any more
+    (``_reset_pools_after_fork`` dropped them), so this closes only the
+    child's own. Connections still checked out are left alone.
+    """
+    _dispose_pools(close=True, failure="Failed to close a PQ connection pool")
+
+
+def _dispose_pools(*, close: bool, failure: str) -> None:
     for instance in list(_live_instances):
         try:
-            instance._engine.dispose(close=False)
+            instance._engine.dispose(close=close)
         except Exception:
-            # One failing instance must not leave the others on their
-            # inherited pools.
-            logger.exception("Failed to reset a PQ connection pool after fork")
+            # One failing instance must not stop the others.
+            logger.exception(failure)
 
 
 if hasattr(os, "register_at_fork"):

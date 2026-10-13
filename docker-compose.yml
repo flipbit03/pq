@@ -17,7 +17,9 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # Postgres 18 images keep their data under /var/lib/postgresql/18 and
+      # refuse to start with a volume on the old path, /var/lib/postgresql/data.
+      - pgdata:/var/lib/postgresql
 
   # Speaks TLS only (tests/tls/pg_hba.conf rejects plain TCP), with the
   # test-only certificate in tests/tls. Some fork bugs only show over TLS: a
@@ -41,4 +43,4 @@ services:
         -c hba_file=/certs-src/pg_hba.conf
 
 volumes:
-  postgres_data:
+  pgdata:

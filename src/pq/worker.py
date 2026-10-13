@@ -26,6 +26,7 @@ from croniter import croniter
 from loguru import logger
 from sqlalchemy import func, or_, select, update
 
+from pq.client import _close_pools_before_exit
 from pq.models import Periodic, Task, TaskStatus
 from pq.registry import resolve_function_path
 from pq.serialization import deserialize
@@ -330,17 +331,23 @@ def _run_in_child(
             pass  # Don't let hook errors mask task errors
 
     if error is None:
-        os._exit(EXIT_SUCCESS)
+        exit_code = EXIT_SUCCESS
     elif isinstance(error, asyncio.TimeoutError):
-        os._exit(EXIT_TIMEOUT)
+        exit_code = EXIT_TIMEOUT
     else:
+        exit_code = EXIT_FAILURE
         # Send error message to parent via pipe
         try:
             error_msg = f"{type(error).__name__}: {error}\n{error_tb}"
             os.write(error_write_fd, error_msg.encode("utf-8", errors="replace"))
         except Exception:
             pass  # Best effort
-        os._exit(EXIT_FAILURE)
+
+    # Hang up cleanly on any connection the task opened through pq. Not done
+    # in _child_timeout_handler: a signal handler can interrupt pool code
+    # that holds the pool's lock.
+    _close_pools_before_exit()
+    os._exit(exit_code)
 
 
 def _fork_child(

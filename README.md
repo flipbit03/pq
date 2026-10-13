@@ -227,7 +227,7 @@ Hooks run in the forked child, making them safe for fork-unsafe resources like O
 
 ### Calling pq from a task
 
-A task can use your application's `PQ` instance, for example to enqueue a follow-up task. Each forked child gets a fresh connection pool and opens its own connections.
+A task can use your application's `PQ` instance, for example to enqueue a follow-up task. Each forked child gets a fresh connection pool, opens its own connections, and closes them when the task ends. A child killed by its timeout or by a signal exits without closing them.
 
 If your own code forks (with `os.fork()` or `multiprocessing`), fork outside an open `pq.session()`. A connection checked out at fork time stays shared between the two processes.
 
