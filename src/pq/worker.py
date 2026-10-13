@@ -169,17 +169,19 @@ class _ShutdownState:
     ``run_worker`` resets it on entry.
     """
 
-    requested: bool = False
+    signum: int | None = None  # signal that requested the shutdown
     deadline: float | None = None  # time.monotonic() deadline, set on signal
     drain_timeout: float = DEFAULT_DRAIN_TIMEOUT
-    signum: int | None = None  # signal that requested the shutdown
     logged: bool = False  # log_request() already ran for this shutdown
 
+    @property
+    def requested(self) -> bool:
+        return self.signum is not None
+
     def reset(self, drain_timeout: float) -> None:
-        self.requested = False
+        self.signum = None
         self.deadline = None
         self.drain_timeout = drain_timeout
-        self.signum = None
         self.logged = False
 
     def deadline_passed(self) -> bool:
@@ -220,9 +222,8 @@ def _handle_shutdown_signal(signum: int, frame: FrameType | None) -> None:
     """
     if _shutdown.requested:
         return
-    _shutdown.signum = signum
     _shutdown.deadline = time.monotonic() + _shutdown.drain_timeout
-    _shutdown.requested = True
+    _shutdown.signum = signum
 
 
 def _install_shutdown_handlers() -> dict[int, _SignalHandler] | None:
