@@ -17,24 +17,27 @@ import gc
 import multiprocessing
 import multiprocessing.managers
 import os
+import signal
 import sys
-import time
 import weakref
-from typing import Any
+from collections.abc import Generator
+from multiprocessing.managers import ListProxy
+from unittest.mock import Mock
 
 import pytest
 from loguru import logger
 from sqlalchemy import event, text
 
+from pq import client
 from pq.client import PQ, _live_instances
 
-_shared_results: Any = None
+_shared_results: ListProxy[int] | None = None
 _app_pq: PQ | None = None
 """The application's PQ instance, as a handler reaches it: a module global
 captured before the fork, the way applications hold a PQ singleton."""
 
 
-def _set_shared_results(results: Any) -> None:
+def _set_shared_results(results: ListProxy[int]) -> None:
     global _shared_results
     _shared_results = results
 
@@ -71,6 +74,7 @@ def _backend_pids_in_fork(*instances: PQ) -> list[int]:
 
 def backend_pid_handler() -> None:
     assert _app_pq is not None
+    assert _shared_results is not None
     _shared_results.append(_backend_pid(_app_pq))
 
 
@@ -86,7 +90,7 @@ def noop_handler() -> None:
 
 
 def _run_worker_capturing_errors(
-    db_url: str, errors: Any, app_pq_holder: Any, seconds: float
+    db_url: str, errors: ListProxy[str], seconds: float
 ) -> None:
     """Worker process: run the real loop for ``seconds``, recording ERROR logs."""
     from pq.worker import run_worker
@@ -97,14 +101,10 @@ def _run_worker_capturing_errors(
         lambda message: errors.append(message.record["message"]),
         level="ERROR",
     )
-    app_pq_holder.append(os.getpid())
-    deadline = time.monotonic() + seconds
 
     # Stop the loop from a signal once the window is over.
-    import signal
-
     signal.signal(signal.SIGALRM, lambda *_: os.kill(os.getpid(), signal.SIGTERM))
-    signal.setitimer(signal.ITIMER_REAL, max(deadline - time.monotonic(), 0.1))
+    signal.setitimer(signal.ITIMER_REAL, seconds)
     run_worker(pq, concurrency=2, poll_interval=0.02, drain_timeout=5)
 
 
@@ -133,14 +133,13 @@ class TestTaskChildConnections:
         """The real worker loop must claim cleanly while a child holds a query
         open through the application's PQ instance."""
         errors = manager.list()
-        started = manager.list()
         pq.enqueue(hold_connection_handler, seconds=2.0)
         for _ in range(5):
             pq.enqueue(noop_handler)
 
         worker = multiprocessing.get_context("fork").Process(
             target=_run_worker_capturing_errors,
-            args=(db_url, errors, started, 6.0),
+            args=(db_url, errors, 6.0),
         )
         worker.start()
         worker.join(timeout=30)
@@ -181,7 +180,7 @@ def _child_queries_while_parent_holds_session(pq: PQ) -> None:
 
 class TestTaskChildConnectionsOverTls:
     @pytest.fixture
-    def tls_pq(self, tls_db_url: str) -> Any:
+    def tls_pq(self, tls_db_url: str) -> Generator[PQ, None, None]:
         pq = PQ(tls_db_url)
         with pq.session() as session:
             uses_tls = session.execute(
@@ -205,14 +204,13 @@ class TestTaskChildConnectionsOverTls:
         manager: multiprocessing.managers.SyncManager,
     ) -> None:
         errors = manager.list()
-        started = manager.list()
         tls_pq.enqueue(hold_connection_handler, seconds=2.0)
         for _ in range(5):
             tls_pq.enqueue(noop_handler)
 
         worker = multiprocessing.get_context("fork").Process(
             target=_run_worker_capturing_errors,
-            args=(tls_db_url, errors, started, 6.0),
+            args=(tls_db_url, errors, 6.0),
         )
         worker.start()
         worker.join(timeout=30)
@@ -301,3 +299,52 @@ class TestForkHookInstanceTracking:
             for instance in instances:
                 event.remove(instance._engine, "engine_disposed", fail)
                 instance.close()
+
+
+class TestResetPoolsAfterFork:
+    """The fork hook on its own, with mocked engines: no fork, no database."""
+
+    @pytest.fixture
+    def engines(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> Generator[list[Mock], None, None]:
+        """Two tracked PQ instances whose engines are mocks."""
+        monkeypatch.setattr(client, "_live_instances", weakref.WeakSet())
+        engines = [Mock(), Mock()]
+        # Held until teardown: the hook's set only references them weakly.
+        instances = [PQ("postgresql://localhost/unused") for _ in engines]
+        for instance, engine in zip(instances, engines, strict=True):
+            monkeypatch.setattr(instance, "_engine", engine)
+        yield engines
+
+    def test_drops_every_pool_without_closing_its_connections(
+        self, engines: list[Mock]
+    ) -> None:
+        client._reset_pools_after_fork()
+
+        for engine in engines:
+            engine.dispose.assert_called_once_with(close=False)
+
+    def test_logs_a_failure_and_resets_the_other_instances(
+        self, engines: list[Mock]
+    ) -> None:
+        for engine in engines:
+            engine.dispose.side_effect = RuntimeError("listener failed")
+        errors: list[str] = []
+        sink = logger.add(
+            lambda message: errors.append(
+                f"{message.record['message']}: {message.record['exception']}"
+            ),
+            level="ERROR",
+        )
+        try:
+            client._reset_pools_after_fork()
+        finally:
+            logger.remove(sink)
+
+        for engine in engines:
+            engine.dispose.assert_called_once_with(close=False)
+        assert len(errors) == 2
+        for error in errors:
+            assert error.startswith("Failed to reset a PQ connection pool after fork")
+            assert "listener failed" in error
