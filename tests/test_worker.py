@@ -9,6 +9,7 @@ import multiprocessing.managers
 import time
 from collections.abc import Callable, Generator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1798,14 +1799,19 @@ class TestGracefulShutdown(_ForkedWorkers):
         assert "shutdown" in (task.error or "")
         self._assert_no_running(pq)
 
-    def test_sigterm_while_forking_does_not_hang(self) -> None:
+    @pytest.mark.parametrize(
+        "extra_thread", [False, True], ids=["one_thread", "two_threads"]
+    )
+    def test_sigterm_while_forking_does_not_hang(self, extra_thread: bool) -> None:
         """SIGTERM handled during fork() must not hang the worker: loguru
-        keeps its handler locks acquired across fork(), and the drain handler
-        logs. Without the signal mask in _fork_child about half of these
-        workers hang."""
+        keeps its handler locks acquired across fork(), so a drain handler
+        that logs blocks on them forever. The second case gives the worker an
+        idle thread (as Sentry or an OTel exporter would), which can take a
+        process-wide SIGTERM even while the forking thread blocks it."""
         import os
         import random
         import signal as sig
+        import threading
 
         from pq.models import Task
         from pq.worker import _fork_child, _handle_shutdown_signal, _shutdown
@@ -1814,6 +1820,10 @@ class TestGracefulShutdown(_ForkedWorkers):
             pid = os.fork()
             if pid == 0:
                 try:
+                    if extra_thread:
+                        threading.Thread(
+                            target=threading.Event().wait, daemon=True
+                        ).start()
                     _shutdown.reset(drain_timeout=1)
                     sig.signal(sig.SIGTERM, _handle_shutdown_signal)
                     while not _shutdown.requested:
@@ -1832,6 +1842,56 @@ class TestGracefulShutdown(_ForkedWorkers):
             time.sleep(random.uniform(0.05, 0.15))
             os.kill(pid, sig.SIGTERM)
             self._wait_for_exit(pid, timeout=5)
+
+    @pytest.mark.parametrize(
+        ("concurrency", "with_task"),
+        [(1, True), (2, True), (1, False)],
+        ids=["sequential_busy", "concurrent_busy", "sequential_idle"],
+    )
+    def test_sigterm_is_logged_once_by_the_worker_loop(
+        self,
+        pq: PQ,
+        db_url: str,
+        manager: multiprocessing.managers.SyncManager,
+        tmp_path: Path,
+        concurrency: int,
+        with_task: bool,
+    ) -> None:
+        """The signal handler doesn't log, so the worker loop logs the
+        request: promptly, once, and before the worker stops. A busy worker
+        logs it while its task is still running."""
+        import os
+        import signal as sig
+
+        from loguru import logger
+
+        _set_shared_results(manager.list())
+        log_path = tmp_path / "worker.log"
+        sink = logger.add(log_path, level="INFO", format="{message}", buffering=1)
+        try:
+            pid = self._fork_worker(db_url, concurrency=concurrency, drain_timeout=10.0)
+            if with_task:
+                task_id = pq.enqueue(
+                    shutdown_probe_handler, duration=3.0, marker="done"
+                )
+                self._wait_for(lambda: self._task_running(pq, task_id))
+            else:
+                time.sleep(0.5)  # let the worker install handlers and poll
+
+            os.kill(pid, sig.SIGTERM)
+            self._wait_for(lambda: "Received signal" in log_path.read_text(), timeout=2)
+            if with_task:
+                assert self._task_running(pq, task_id)
+            self._wait_for_exit(pid)
+        finally:
+            logger.remove(sink)
+
+        lines = log_path.read_text().splitlines()
+        received = [line for line in lines if line.startswith("Received signal")]
+        assert received == [
+            f"Received signal {sig.SIGTERM.value}, draining (drain_timeout=10.0s)..."
+        ]
+        assert lines.index(received[0]) < lines.index("Worker stopped.")
 
     def test_periodic_in_flight_lock_cleared(self, pq: PQ, db_url: str) -> None:
         """Periodic task killed by the drain: locked_until cleared, schedule
@@ -1874,6 +1934,85 @@ class TestGracefulShutdown(_ForkedWorkers):
             run_worker(pq, drain_timeout=-1.0)
         with pytest.raises(ValueError):
             run_worker(pq, drain_timeout=float("inf"))
+
+
+class TestShutdownSignalHandler:
+    """Unit tests for the drain handler and the log line it defers."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_shutdown_state(self) -> Generator[None, None, None]:
+        from pq.worker import DEFAULT_DRAIN_TIMEOUT, _shutdown
+
+        _shutdown.reset(drain_timeout=5.0)
+        yield
+        _shutdown.reset(DEFAULT_DRAIN_TIMEOUT)
+
+    @pytest.fixture
+    def messages(self) -> Generator[list[str], None, None]:
+        from loguru import logger
+
+        captured: list[str] = []
+        sink = logger.add(captured.append, level="DEBUG", format="{message}")
+        yield captured
+        logger.remove(sink)
+
+    def test_handler_requests_drain_without_logging(self, messages: list[str]) -> None:
+        import signal as sig
+
+        from pq.worker import _handle_shutdown_signal, _shutdown
+
+        before = time.monotonic()
+        _handle_shutdown_signal(sig.SIGTERM.value, None)
+
+        assert _shutdown.requested
+        assert _shutdown.signum == sig.SIGTERM
+        assert _shutdown.deadline is not None
+        assert before + 5.0 <= _shutdown.deadline <= time.monotonic() + 5.0
+        assert messages == []
+
+    def test_repeat_signal_keeps_the_first(self) -> None:
+        import signal as sig
+
+        from pq.worker import _handle_shutdown_signal, _shutdown
+
+        _handle_shutdown_signal(sig.SIGTERM.value, None)
+        deadline = _shutdown.deadline
+        _handle_shutdown_signal(sig.SIGINT.value, None)
+
+        assert _shutdown.signum == sig.SIGTERM
+        assert _shutdown.deadline == deadline
+
+    def test_log_request_logs_once_after_a_signal(self, messages: list[str]) -> None:
+        import signal as sig
+
+        from pq.worker import _handle_shutdown_signal, _shutdown
+
+        _shutdown.log_request()
+        assert messages == []
+
+        _handle_shutdown_signal(sig.SIGINT.value, None)
+        _shutdown.log_request()
+        _shutdown.log_request()
+        assert messages == [
+            f"Received signal {sig.SIGINT.value}, draining (drain_timeout=5.0s)...\n"
+        ]
+
+    def test_reset_clears_the_signal_and_the_log_flag(
+        self, messages: list[str]
+    ) -> None:
+        import signal as sig
+
+        from pq.worker import _handle_shutdown_signal, _shutdown
+
+        _handle_shutdown_signal(sig.SIGTERM.value, None)
+        _shutdown.log_request()
+        _shutdown.reset(drain_timeout=5.0)
+
+        assert _shutdown.signum is None
+        assert not _shutdown.logged
+        _handle_shutdown_signal(sig.SIGTERM.value, None)
+        _shutdown.log_request()
+        assert len(messages) == 2
 
 
 def periodic_sleep_handler() -> None:
