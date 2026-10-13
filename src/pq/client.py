@@ -2,6 +2,8 @@
 
 import importlib.resources
 import math
+import os
+import weakref
 from collections.abc import Callable, Set
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -62,6 +64,42 @@ def _validate_max_runtime(max_runtime_seconds: float | None) -> None:
         )
 
 
+_live_instances: "weakref.WeakSet[PQ]" = weakref.WeakSet()
+"""Every ``PQ`` instance, so a forked child can reset their pools. Weak
+references: the set never keeps an instance alive. ``close()`` does not remove
+an instance: its engine reconnects if it is used again."""
+
+
+def _reset_pools_after_fork() -> None:
+    """Give each ``PQ`` instance an empty pool in a forked child.
+
+    A child inherits the parent's pooled connections, sockets and TLS state
+    included. Querying on one makes two processes speak on one Postgres
+    session: over TLS the parent's next record fails with ``bad record mac``,
+    over a plain socket the two processes read each other's results.
+
+    ``close=False`` drops the inherited pool without closing its connections.
+    Closing them would send a terminate message on the parent's sockets and
+    break the parent's sessions.
+
+    Connections checked out at fork time are not covered: if the child returns
+    one (for example by leaving a ``with pq.session()`` block it was forked
+    in), the commit and rollback still go out on the parent's socket. Do not
+    fork inside an open ``pq.session()``.
+    """
+    for instance in list(_live_instances):
+        try:
+            instance._engine.dispose(close=False)
+        except Exception:
+            # One failing instance must not leave the others on their
+            # inherited pools.
+            logger.exception("Failed to reset a PQ connection pool after fork")
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_pools_after_fork)
+
+
 class PQ:
     """Postgres-backed task queue client."""
 
@@ -79,6 +117,7 @@ class PQ:
             pool_recycle=1800,
         )
         self._session_factory = sessionmaker(bind=self._engine)
+        _live_instances.add(self)
 
     @contextmanager
     def session(self) -> Any:

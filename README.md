@@ -37,7 +37,7 @@ Requires PostgreSQL and Python 3.13+.
 
 ## Features
 
-- **Fork isolation** -- Each task runs in a forked child process. If it OOMs, segfaults, or crashes, the worker keeps running.
+- **Fork isolation** -- Each task runs in a forked child process. If it OOMs, segfaults, or crashes, the worker keeps running. Each child gets a fresh connection pool and opens its own database connections.
 - **No extra infrastructure** -- Uses your existing Postgres. No broker to deploy, monitor, or lose data.
 - **Transactional enqueueing** -- Enqueue tasks in the same database transaction as your writes. If the transaction rolls back, the task is never created.
 - **Periodic tasks** -- Schedule with intervals (`timedelta`) or cron expressions. Control overlap, pause/resume without deleting.
@@ -224,6 +224,12 @@ pq.run_worker(pre_execute=setup_tracing, post_execute=flush_tracing)
 ```
 
 Hooks run in the forked child, making them safe for fork-unsafe resources like OpenTelemetry.
+
+### Calling pq from a task
+
+A task can use your application's `PQ` instance, for example to enqueue a follow-up task. Each forked child gets a fresh connection pool and opens its own connections.
+
+If your own code forks (with `os.fork()` or `multiprocessing`), fork outside an open `pq.session()`. A connection checked out at fork time stays shared between the two processes.
 
 ## Logging
 

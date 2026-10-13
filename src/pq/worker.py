@@ -169,14 +169,20 @@ class _ShutdownState:
     ``run_worker`` resets it on entry.
     """
 
-    requested: bool = False
+    signum: int | None = None  # signal that requested the shutdown
     deadline: float | None = None  # time.monotonic() deadline, set on signal
     drain_timeout: float = DEFAULT_DRAIN_TIMEOUT
+    logged: bool = False  # log_request() already ran for this shutdown
+
+    @property
+    def requested(self) -> bool:
+        return self.signum is not None
 
     def reset(self, drain_timeout: float) -> None:
-        self.requested = False
+        self.signum = None
         self.deadline = None
         self.drain_timeout = drain_timeout
+        self.logged = False
 
     def deadline_passed(self) -> bool:
         """True once shutdown was requested and the drain budget is spent."""
@@ -184,25 +190,40 @@ class _ShutdownState:
             return False
         return self.deadline is None or time.monotonic() >= self.deadline
 
+    def log_request(self) -> None:
+        """Log the shutdown request once, from the worker loop.
+
+        The signal handler can't log it itself (see
+        ``_handle_shutdown_signal``), so the loops call this when they see
+        ``requested``.
+        """
+        if not self.requested or self.logged:
+            return
+        self.logged = True
+        logger.info(
+            f"Received signal {self.signum}, draining"
+            f" (drain_timeout={self.drain_timeout}s)..."
+        )
+
 
 _shutdown = _ShutdownState()
 
 
 def _handle_shutdown_signal(signum: int, frame: FrameType | None) -> None:
-    """SIGTERM/SIGINT handler: request a drain, never raise.
+    """SIGTERM/SIGINT handler: request a drain, never raise, never log.
 
     Raising from here would land at arbitrary bytecode and could orphan a
-    task (e.g. between claim-commit and child registration). Repeat signals
-    during the drain are ignored so they can't abandon remaining children.
+    task (e.g. between claim-commit and child registration). Logging from
+    here can deadlock: the handler runs on the main thread wherever it was
+    interrupted, and loguru holds its handler locks for the whole of
+    ``os.fork()``. The worker loops log the request instead
+    (``_ShutdownState.log_request``). Repeat signals during the drain are
+    ignored so they can't abandon remaining children.
     """
     if _shutdown.requested:
         return
     _shutdown.deadline = time.monotonic() + _shutdown.drain_timeout
-    _shutdown.requested = True
-    logger.info(
-        f"Received signal {signum}, draining"
-        f" (drain_timeout={_shutdown.drain_timeout}s)..."
-    )
+    _shutdown.signum = signum
 
 
 def _install_shutdown_handlers() -> dict[int, _SignalHandler] | None:
@@ -385,6 +406,7 @@ def _wait_for_child(child_pid: int, read_fd: int) -> _ChildResult:
         pid, raw_status, rusage = os.wait4(child_pid, os.WNOHANG)
         if pid != 0:
             break
+        _shutdown.log_request()
         if not killed_by_drain and _shutdown.deadline_passed():
             _kill_child_group(child_pid)
             killed_by_drain = True
@@ -715,6 +737,7 @@ def run_worker(
         except KeyboardInterrupt:
             # Fallback for non-main-thread workers (no handlers installed).
             pass
+        _shutdown.log_request()
         logger.info("Worker stopped.")
     finally:
         _restore_shutdown_handlers(previous_handlers)
@@ -1488,6 +1511,7 @@ def _run_concurrent(
         # drain below still runs, just without a deadline.
         pass
 
+    _shutdown.log_request()
     if children:
         logger.info(f"Shutting down, draining {len(children)} in-flight task(s)...")
         # _wait_for_child inside _reap_and_update enforces the drain
