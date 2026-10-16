@@ -10,6 +10,7 @@
         - run_db_migrations
         - enqueue
         - upsert
+        - upsert_many
         - schedule
         - unschedule
         - cancel
@@ -25,6 +26,12 @@
         - clear_failed
         - clear_completed
         - clear_all
+
+## Upsert
+
+::: pq.Upsert
+    options:
+      show_source: false
 
 ## Priority
 

@@ -185,6 +185,37 @@ with PQ(DATABASE_URL) as pq:
 
 If the worker dies while the run is in progress, the stale-task reaper re-queues the row with the waiting version instead of marking it failed. Until then (`stale_task_timeout`, default 1 hour) the waiting version does not run, and with the reaper disabled (`stale_task_timeout=None`) it never runs. Keep `stale_task_timeout` longer than your longest run: if the reaper picks up a run that is still alive, the waiting version can start next to it.
 
+### Many at once
+
+`upsert_many()` takes a list of `Upsert` items and applies each one as `upsert()` would, in one transaction. Use it for a batch: it opens one session and commits once, where a loop of `upsert()` calls commits once per task. If any item is invalid or a write fails, nothing is written.
+
+```python
+from pq import PQ, Upsert
+
+def send_notification(user_id: int, message: str) -> None:
+    print(f"Notifying user {user_id}: {message}")
+
+with PQ("postgresql://localhost/mydb") as pq:
+    task_ids = pq.upsert_many(
+        [
+            Upsert(
+                task=send_notification,
+                kwargs={"user_id": user_id, "message": "Hi"},
+                client_id=f"notify-{user_id}",
+            )
+            for user_id in [1, 2, 3]
+        ]
+    )
+```
+
+An `Upsert` has the same fields as the `upsert()` arguments: `task` and `client_id` are required, and `args` (a tuple), `kwargs` (a dict), `run_at`, `priority` and `max_runtime_seconds` are optional. The item does no checks of its own: `upsert_many()` checks each item with the same code as `upsert()`, so both accept the same values and raise the same errors.
+
+- The returned IDs are in the order of the input list.
+- A repeated `client_id` ends with its last version, and its ID appears once per item.
+- A RUNNING task is not changed: the new version is queued, as with `upsert()`.
+
+The rows are written in `client_id` order, so two batches that share `client_id`s cannot deadlock. Each row stays locked until the batch commits, and a worker that finishes one of these tasks waits for the commit. Keep batches to hundreds or a few thousand items, and split larger lists into chunks. Each chunk is then its own transaction.
+
 ## Worker Lifecycle Hooks
 
 Use `pre_execute` and `post_execute` hooks to run code before/after task execution. Hooks run in the forked child process, making them ideal for fork-unsafe resources like OpenTelemetry.

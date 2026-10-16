@@ -1,12 +1,16 @@
 """Tests for PQ client."""
 
+from collections.abc import Callable
+
 import pytest
 from croniter import croniter
 from datetime import UTC, datetime, timedelta
 from sqlalchemy.exc import IntegrityError
 
-from pq.client import PQ
-from pq.models import Periodic, Task
+from pq.client import PQ, Upsert
+from pq.models import Periodic, Task, TaskStatus
+from pq.priority import Priority
+from pq.serialization import serialize
 
 
 def dummy_handler(key: str = "") -> None:
@@ -699,6 +703,258 @@ def _mark_running(pq: PQ, task_id: int, started_at: datetime | None = None) -> N
                 attempts=1,
             )
         )
+
+
+class TestUpsertMany:
+    """``upsert_many`` applies each item as ``upsert`` would, in one transaction."""
+
+    def test_upsert_many_returns_ids_in_input_order(self, pq: PQ) -> None:
+        """IDs follow the input, not the ``client_id`` write order."""
+        existing_b = pq.upsert(upsert_handler, value=0, client_id="b")
+        existing_a = pq.upsert(upsert_handler, value=0, client_id="a")
+
+        ids = pq.upsert_many(
+            [
+                Upsert(task=upsert_handler, kwargs={"value": 1}, client_id="c"),
+                Upsert(task=upsert_handler, kwargs={"value": 2}, client_id="a"),
+                Upsert(task=upsert_handler, kwargs={"value": 3}, client_id="b"),
+            ]
+        )
+
+        new_c = pq.get_task_by_client_id("c")
+        assert new_c is not None
+        assert ids == [new_c.id, existing_a, existing_b]
+        for client_id, value in [("c", 1), ("a", 2), ("b", 3)]:
+            task = pq.get_task_by_client_id(client_id)
+            assert task is not None
+            assert task.payload["kwargs"] == {"value": value}
+        assert pq.pending_count() == 3
+
+    def test_upsert_many_writes_every_field(self, pq: PQ) -> None:
+        """Positional args, run_at, priority and max_runtime_seconds reach the row."""
+        run_at = datetime.now(UTC) + timedelta(hours=1)
+        first, second = pq.upsert_many(
+            [
+                Upsert(
+                    task=upsert_handler,
+                    args=(1, "x"),
+                    kwargs={"k": True},
+                    client_id="first",
+                    run_at=run_at,
+                    priority=Priority.HIGH,
+                    max_runtime_seconds=30.0,
+                ),
+                Upsert(task=dummy_handler, client_id="second"),
+            ]
+        )
+
+        task = pq.get_task(first)
+        assert task is not None
+        assert task.name == "tests.test_client:upsert_handler"
+        assert task.payload == serialize((1, "x"), {"k": True})
+        assert task.run_at == run_at
+        assert task.priority == Priority.HIGH.value
+        assert task.max_runtime_seconds == 30.0
+        task = pq.get_task(second)
+        assert task is not None
+        assert task.name == "tests.test_client:dummy_handler"
+        assert task.payload == serialize((), {})
+        assert task.priority == Priority.NORMAL.value
+        assert task.max_runtime_seconds is None
+
+    def test_upsert_many_repeated_client_id_keeps_last_version(self, pq: PQ) -> None:
+        """A repeated ``client_id`` ends with its last version, under one id."""
+        first, second = pq.upsert_many(
+            [
+                Upsert(task=upsert_handler, kwargs={"value": 1}, client_id="same"),
+                Upsert(task=upsert_handler, kwargs={"value": 2}, client_id="same"),
+            ]
+        )
+
+        assert first == second
+        task = pq.get_task_by_client_id("same")
+        assert task is not None
+        assert task.payload["kwargs"] == {"value": 2}
+        assert pq.pending_count() == 1
+
+    def test_upsert_many_parks_version_of_running_row(self, pq: PQ) -> None:
+        """A RUNNING row in a mixed batch is untouched and gets the version parked."""
+
+        task_id = pq.upsert(
+            upsert_handler, value=1, client_id="running", max_runtime_seconds=600.0
+        )
+        _mark_running(pq, task_id)
+        before = pq.get_task(task_id)
+        assert before is not None
+        pending_id = pq.upsert(upsert_handler, value=1, client_id="pending")
+
+        run_at = datetime.now(UTC) + timedelta(minutes=5)
+        ids = pq.upsert_many(
+            [
+                Upsert(
+                    task=dummy_handler,
+                    kwargs={"key": "v2"},
+                    client_id="running",
+                    priority=Priority.HIGH,
+                    run_at=run_at,
+                    max_runtime_seconds=30.0,
+                ),
+                Upsert(task=upsert_handler, kwargs={"value": 2}, client_id="pending"),
+                Upsert(task=upsert_handler, kwargs={"value": 3}, client_id="new"),
+            ]
+        )
+
+        assert ids[:2] == [task_id, pending_id]
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        assert task.name == before.name
+        assert task.payload == before.payload
+        assert task.priority == before.priority
+        assert task.run_at == before.run_at
+        assert task.attempts == 1
+        assert task.started_at == before.started_at
+        assert task.max_runtime_seconds == 600.0
+        assert task.requeue is not None
+        parked = dict(task.requeue)
+        assert datetime.fromisoformat(parked.pop("run_at")) == run_at
+        assert parked == {
+            "name": "tests.test_client:dummy_handler",
+            "payload": serialize((), {"key": "v2"}),
+            "priority": Priority.HIGH.value,
+            "max_runtime_seconds": 30.0,
+        }
+        pending = pq.get_task(pending_id)
+        assert pending is not None
+        assert pending.payload["kwargs"] == {"value": 2}
+        assert pending.requeue is None
+        # The PENDING and the new row are claimable; the RUNNING one is not.
+        assert pq.pending_count() == 2
+
+    def test_upsert_many_validates_before_any_write(self, pq: PQ) -> None:
+        """An invalid item raises before the session opens."""
+        with pytest.raises(ValueError):
+            pq.upsert_many(
+                [
+                    Upsert(task=upsert_handler, client_id="ok"),
+                    Upsert(task=lambda: None, client_id="lambda"),
+                ]
+            )
+
+        assert pq.get_task_by_client_id("ok") is None
+
+    def test_upsert_many_invalid_max_runtime_writes_nothing(self, pq: PQ) -> None:
+        """``max_runtime_seconds <= 0`` on one item rejects the batch."""
+        with pytest.raises(ValueError, match="max_runtime_seconds"):
+            pq.upsert_many(
+                [
+                    Upsert(task=upsert_handler, client_id="ok"),
+                    Upsert(task=upsert_handler, client_id="bad", max_runtime_seconds=0),
+                ]
+            )
+
+        assert pq.get_task_by_client_id("ok") is None
+
+    def test_upsert_many_rolls_back_after_db_error(self, pq: PQ) -> None:
+        """A database error on a later item undoes the items already written."""
+        from sqlalchemy.exc import DataError
+
+        pq.upsert(upsert_handler, value=0, client_id="a")
+
+        with pytest.raises(DataError):
+            pq.upsert_many(
+                [
+                    Upsert(task=upsert_handler, kwargs={"value": 1}, client_id="a"),
+                    Upsert(task=upsert_handler, kwargs={"value": 1}, client_id="b"),
+                    # JSONB rejects \u0000: fails in Postgres, after "a" and "b".
+                    Upsert(
+                        task=upsert_handler, kwargs={"value": "\x00"}, client_id="c"
+                    ),
+                ]
+            )
+
+        task = pq.get_task_by_client_id("a")
+        assert task is not None
+        assert task.payload["kwargs"] == {"value": 0}
+        assert pq.get_task_by_client_id("b") is None
+
+    @pytest.mark.parametrize(
+        ("task", "max_runtime_seconds"),
+        [(lambda: None, None), (upsert_handler, 0), (upsert_handler, -1.0)],
+    )
+    def test_upsert_many_rejects_what_upsert_rejects(
+        self,
+        pq: PQ,
+        task: Callable[..., object],
+        max_runtime_seconds: float | None,
+    ) -> None:
+        """Items are checked by ``upsert()``'s code: same error, same message."""
+        with pytest.raises(ValueError) as single:
+            pq.upsert(task, client_id="x", max_runtime_seconds=max_runtime_seconds)
+        with pytest.raises(ValueError) as many:
+            pq.upsert_many(
+                [
+                    Upsert(
+                        task=task,
+                        client_id="x",
+                        max_runtime_seconds=max_runtime_seconds,
+                    )
+                ]
+            )
+
+        assert str(many.value) == str(single.value)
+        assert pq.get_task_by_client_id("x") is None
+
+    def test_upsert_repr_hides_arguments(self) -> None:
+        """``repr`` leaves out task arguments, which may hold secrets."""
+        item = Upsert(
+            task=upsert_handler,
+            args=("s3cr3t",),
+            kwargs={"token": "s3cr3t"},
+            client_id="x",
+        )
+
+        assert "s3cr3t" not in repr(item)
+
+    def test_concurrent_batches_in_opposite_orders_do_not_deadlock(
+        self, pq: PQ
+    ) -> None:
+        """Two batches over the same rows, in opposite orders, both commit."""
+        import threading
+
+        keys = [f"k{i}" for i in range(1000)]
+        pq.upsert_many([Upsert(task=upsert_handler, client_id=k) for k in keys])
+        errors: list[Exception] = []
+        start = threading.Barrier(2)
+
+        def run(order: list[str], value: int) -> None:
+            start.wait()
+            try:
+                pq.upsert_many(
+                    [
+                        Upsert(
+                            task=upsert_handler, kwargs={"value": value}, client_id=k
+                        )
+                        for k in order
+                    ]
+                )
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=run, args=(keys, 1)),
+            threading.Thread(target=run, args=(keys[::-1], 2)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+
+    def test_upsert_many_empty_returns_empty(self, pq: PQ) -> None:
+        """An empty batch writes nothing."""
+        assert pq.upsert_many([]) == []
 
 
 class TestUpsertWhileRunning:

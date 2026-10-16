@@ -1,6 +1,6 @@
 """PQ - Postgres-backed task queue."""
 
-from pq.client import PQ
+from pq.client import PQ, Upsert
 from pq.models import Periodic, Task, TaskStatus
 from pq.priority import Priority
 from pq.worker import PostExecuteHook, PreExecuteHook, TaskTimeoutError
@@ -16,4 +16,5 @@ __all__ = [
     "Task",
     "TaskStatus",
     "TaskTimeoutError",
+    "Upsert",
 ]

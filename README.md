@@ -120,6 +120,16 @@ def backfill(offset: int) -> None:
 
 If the worker running the task dies, the queued version runs after the stale-task reaper picks up the row (`stale_task_timeout`, default 1 hour). Keep `stale_task_timeout` longer than your longest run: if the reaper picks up a run that is still alive, the queued version can start next to it.
 
+For a batch, `upsert_many()` takes a list of `Upsert` items and writes them in one transaction:
+
+```python
+from pq import Upsert
+
+pq.upsert_many(
+    [Upsert(task=send_email, kwargs={"to": to}, client_id=f"welcome-{to}") for to in emails]
+)
+```
+
 ## Periodic Tasks
 
 ### Intervals
